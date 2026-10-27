@@ -40,6 +40,8 @@ cp -R milvus-operator-upgrade/skills/milvus-operator-upgrade ~/.agents/skills/
 
 升级**只改 Milvus 镜像**；etcd、MinIO、operator 不动；NodePort 保持；操作只发生在你给的命名空间。
 
+**开启了鉴权（`authorizationEnabled=true`）**：备份/恢复始终带 `milvus-backup --rbac`，用户、角色、授权会一起备份并在回滚时恢复；需要在 master 的环境变量 `MILVUS_TOKEN=user:password`（root/admin）提供凭据（或 `MILVUS_TOKEN_FILE`，600 权限文件），**不要发到聊天里**。升级/恢复前后会比较 RBAC 快照，不一致会以退出码 14（部分）结束，不报告成功；旧备份没有 RBAC 时恢复前会让你选择“取消 / 仅恢复数据”。可选 `--rbac-test` 用一个应用用户验证“允许的操作成功、禁止的操作被拒”。详见 SKILL.md 的「Milvus 鉴权与 RBAC」。
+
 已验证：`2.6.25 → 3.0.3` 与回滚。细节见 [`skills/milvus-operator-upgrade/SKILL.md`](./skills/milvus-operator-upgrade/SKILL.md)。
 
 ## License

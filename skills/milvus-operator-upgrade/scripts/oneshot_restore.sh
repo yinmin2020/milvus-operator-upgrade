@@ -3,14 +3,19 @@
 # 用法: oneshot_restore.sh <NS> --check-only [--name CR]   # 只读：列出可用备份(BACKUP 行)与建议恢复镜像，不建任何对象
 #       oneshot_restore.sh <NS> <RESTORE_IMAGE> [--name CR] [--backup NAME] [--backup-bin PATH] [--probe-collection C]
 #                         [--restore-timeout 3600] [--healthy-timeout 1200] [--token-ttl 4h] [--workdir DIR] [--yes]
-# 退出码: 0 成功 | 2 参数/需要选择 | 3 环境 | 4 权限/隔离自检 | 5 预检(备份/镜像/配置，尚未删除任何东西)
-#         10 删除旧实例 | 11 重建/Healthy/nodePort | 12 数据恢复/加载 | 13 校验 | 9 探针不一致 | 130 中断/未确认
+#                         [--accept-rbac-loss] [--rbac-test [--rbac-test-collection C] [--rbac-test-deny list_users,create_collection]]
+# 鉴权（authorizationEnabled=true）：环境变量 MILVUS_TOKEN=user:password（或 MILVUS_TOKEN_FILE=<600 权限文件>），须为 root/admin；恢复始终带 --rbac。
+#   备份里没有 RBAC 元数据（旧备份）时：不加 --accept-rbac-loss 就在删除任何东西之前退出 5；加了则仅恢复数据，结果为“部分恢复”退出 14。
+# 退出码: 0 成功 | 2 参数/需要选择 | 3 环境 | 4 权限/隔离自检 | 5 预检(备份/镜像/配置/凭据/备份无RBAC，尚未删除任何东西)
+#         10 删除旧实例 | 11 重建/Healthy/nodePort | 12 数据恢复/加载 | 13 校验 | 9 探针不一致
+#         14 部分恢复：数据已恢复，但 RBAC（用户/角色/授权）未恢复或与备份时不一致 | 130 中断/未确认
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SA=milvus-upgrader
-usage(){ sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; }
+usage(){ sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
 
 NS=""; RESTORE_IMAGE=""; NAME=""; BACKUP_NAME=""; BACKUP_BIN="${MILVUS_BACKUP_BIN:-}"; PROBE=""; YES=0; CHECK_ONLY=0
+ACCEPT_RBAC_LOSS=0; RBAC_TEST=0; RBAC_TEST_COLL=""; RBAC_TEST_DENY=list_users
 RESTORE_TIMEOUT=3600; HEALTHY_TIMEOUT=1200; PULL_TIMEOUT=900; TOKEN_TTL=4h; WORKBASE=/root/milvus-upgrade
 ADMIN_KC=${ADMIN_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}
 pos=()
@@ -25,6 +30,10 @@ while [ $# -gt 0 ]; do
     --pull-timeout) PULL_TIMEOUT=${2:?}; shift 2;;
     --token-ttl) TOKEN_TTL=${2:?}; shift 2;;
     --workdir) WORKBASE=${2:?}; shift 2;;
+    --accept-rbac-loss) ACCEPT_RBAC_LOSS=1; shift;;
+    --rbac-test) RBAC_TEST=1; shift;;
+    --rbac-test-collection) RBAC_TEST_COLL=${2:?}; shift 2;;
+    --rbac-test-deny) RBAC_TEST_DENY=${2:?}; shift 2;;
     --check-only) CHECK_ONLY=1; shift;;
     --yes|-y) YES=1; shift;;
     -h|--help) usage; exit 0;;
@@ -36,6 +45,7 @@ if [ $CHECK_ONLY = 1 ]; then
   [ ${#pos[@]} -eq 1 ] || { usage; exit 2; }
   [[ ${pos[0]} =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || { echo "NS 不合法: ${pos[0]}"; echo "CHECK_RESULT rc=2"; exit 2; }
   ca=(restore "${pos[0]}" --workdir "$WORKBASE"); [ -z "$NAME" ] || ca+=(--name "$NAME"); [ -z "$BACKUP_BIN" ] || ca+=(--backup-bin "$BACKUP_BIN")
+  [ $RBAC_TEST = 0 ] || ca+=(--rbac-test)
   ADMIN_KUBECONFIG=$ADMIN_KC exec python3 "$SCRIPT_DIR/check.py" "${ca[@]}"
 fi
 [ ${#pos[@]} -eq 2 ] || { usage; exit 2; }
@@ -100,12 +110,31 @@ cat <<NOTICE
    把备份（优先使用 master 本地导出副本；若只在 MinIO 中则先导出到 master 本地再删除）导入新 MinIO，用 milvus-backup restore
    恢复全部集合并重建索引、加载集合，与备份时记录的探针（行数 + top-5）比对。
 4. 在 [$NS] 临时创建 SA/Role/RoleBinding "$SA"（含删除/创建该 Milvus CR 与删除上述 PVC 的权限）及拉取检查 Pod，结束自动删除。
-5. 期间 Milvus 完全不可用（删除 + 重建 + 导入，取决于数据量）。除上述对象外不修改 [$NS] 内其他资源，也不触碰其他命名空间。
+5. 开启鉴权时：用户/角色/授权随备份（milvus-backup --rbac）一起恢复并与备份时的快照比对；root 密码不在备份里，恢复后会按 MILVUS_TOKEN 改回。
+   备份若没有 RBAC（旧备份）则只能恢复数据，RBAC 需手工重建，结果为“部分恢复”（退出码 14，不算完整恢复）。
+6. 期间 Milvus 完全不可用（删除 + 重建 + 导入，取决于数据量）。除上述对象外不修改 [$NS] 内其他资源，也不触碰其他命名空间。
 =======================================================
 NOTICE
 if [ "$YES" != 1 ]; then
   [ -r /dev/tty ] || die 130 "非交互运行必须加 --yes（agent 须先向用户展示风险提示并获得确认）"
   read -r -p "确认删除当前实例并恢复，请输入 yes: " ans < /dev/tty; [ "$ans" = yes ] || die 130 "用户未确认"
+fi
+
+# 凭据只来自环境变量；MILVUS_TOKEN_FILE / MILVUS_TEST_TOKEN_FILE 指向用户自己在 master 上创建的 600 权限文件（内容 user:password，不经聊天）
+load_token(){ # load_token <变量名> <文件变量名>
+  local v=$1 fv=$2 f m
+  if [ -z "${!v:-}" ] && [ -n "${!fv:-}" ]; then
+    f=${!fv}; [ -r "$f" ] || die 5 "$fv 指向的文件不可读: $f"
+    m=$(stat -c %a "$f" 2>/dev/null || echo 777); [[ $m =~ ^[0-7]00$ ]] || die 5 "$f 权限为 $m：必须是 600 或 400（chmod 600），避免凭据被其他用户读取"
+    printf -v "$v" '%s' "$(head -n1 "$f")"
+  fi
+  export "${v?}"
+}
+load_token MILVUS_TOKEN MILVUS_TOKEN_FILE
+if [ $RBAC_TEST = 1 ]; then
+  load_token MILVUS_TEST_TOKEN MILVUS_TEST_TOKEN_FILE
+  [[ ${MILVUS_TEST_TOKEN:-} == *:* ]] || die 2 "--rbac-test 需要环境变量 MILVUS_TEST_TOKEN=user:password（应用用户，或 MILVUS_TEST_TOKEN_FILE）"
+  [ -n "$RBAC_TEST_COLL" ] || RBAC_TEST_COLL=$PROBE
 fi
 
 # ---------- 0. 环境 ----------
@@ -170,6 +199,7 @@ for k in sys.argv[2].split('.'):
 print('' if d is None else (json.dumps(d) if isinstance(d,(dict,list)) else d))
 PY
 }
+AUTH_CR=$(jq_ spec.config.common.security.authorizationEnabled | tr 'A-Z' 'a-z'); AUTH_ON=${AUTH_CR:-false}
 MODE=$(jq_ spec.mode); MODE=${MODE:-standalone}
 CUR_IMAGE=$(jq_ spec.components.image)
 MQ=$(jq_ spec.dependencies.msgStreamType)
@@ -194,11 +224,11 @@ for f in $(ls -1 "$WORKBASE"/runs/"${NS}"-[0-9]*/backup.meta 2>/dev/null | sort 
   if [ -z "$BACKUP_NAME" ] || [ "$bn" = "$BACKUP_NAME" ]; then META=$f; BACKUP_NAME=$bn; break; fi
 done
 mget(){ [ -n "$META" ] && sed -n "s/^$1=//p" "$META" | head -1; }
-LOCAL_EXPORT=""; PROBE_PRE=""; PROBE_STATE=""; SRC_IMAGE=""
+LOCAL_EXPORT=""; PROBE_PRE=""; PROBE_STATE=""; SRC_IMAGE=""; RBAC_PRE=""
 if [ -n "$META" ]; then
   ed=$(mget EXPORT_DIR); [ -n "$ed" ] && [ -s "$ed/MANIFEST" ] && grep -q " backup/$BACKUP_NAME/" "$ed/MANIFEST" && LOCAL_EXPORT=$ed
   [ -n "$PROBE" ] || PROBE=$(mget PROBE_COLLECTION)
-  PROBE_PRE=$(mget PROBE_PRE); PROBE_STATE=$(mget PROBE_STATE); SRC_IMAGE=$(mget SOURCE_IMAGE)
+  PROBE_PRE=$(mget PROBE_PRE); PROBE_STATE=$(mget PROBE_STATE); SRC_IMAGE=$(mget SOURCE_IMAGE); RBAC_PRE=$(mget RBAC_PRE)
   log "备份元数据: $META → $BACKUP_NAME（升级前镜像 ${SRC_IMAGE:-?}，本地导出 ${LOCAL_EXPORT:-无}，探针 ${PROBE:-无}）"
 fi
 if [ -n "$RESUME" ] && [ -z "$LOCAL_EXPORT" ] && [ -s "$RESUME/backup_export/MANIFEST" ]; then
@@ -256,7 +286,7 @@ read_conf(){ # 读取（当前）实例的 user.yaml 与 MinIO 凭据
   MINIO_ADDR=$(yget minio.address); MINIO_PORT=$(yget minio.port); MINIO_PORT=${MINIO_PORT:-9000}
   MINIO_SSL=$(yget minio.useSSL); MINIO_SSL=${MINIO_SSL:-false}
   CHAN_PREFIX=$(yget msgChannel.chanNamePrefix.cluster); CHAN_PREFIX=${CHAN_PREFIX:-by-dev}
-  AUTH_ON=$(yget common.security.authorizationEnabled)
+  AUTH_ON=$(yget common.security.authorizationEnabled | tr 'A-Z' 'a-z'); AUTH_ON=${AUTH_ON:-${AUTH_CR:-false}}
   local ak sk; ak=$(yget minio.accessKeyID); sk=$(yget minio.secretAccessKey)
   ( umask 077; : > "$CRED" )
   if [ -z "$ak" ] || [ -z "$sk" ]; then
@@ -276,12 +306,15 @@ start_pf(){ # start_pf milvus|minio|etcd ...
             S3_URL="http$([ "$MINIO_SSL" = true ] && echo s || true)://127.0.0.1:$S3_PORT";;
     etcd)   pf etcd "svc/$NAME-etcd" 2379 42379 || return 1; ETCD_EP="127.0.0.1:$PF_PORT";;
   esac; done; }
+yq(){ local x=$1; x=${x//\\/\\\\}; x=${x//\"/\\\"}; printf '%s' "$x"; }   # YAML 双引号字符串转义（不经 sed，密码里有 | & \ 也安全）
 write_backup_yaml(){
-  local ak sk; ak=$(sed -n 1p "$CRED"); sk=$(sed -n 2p "$CRED")
+  local ak sk au=""; ak=$(sed -n 1p "$CRED"); sk=$(sed -n 2p "$CRED")
+  if [ -n "${MILVUS_TOKEN:-}" ]; then au=$(printf '  user: "%s"\n  password: "%s"' "$(yq "${MILVUS_TOKEN%%:*}")" "$(yq "${MILVUS_TOKEN#*:}")"); fi
   ( umask 077; cat > "$BK_DIR/backup.yaml" <<YAML
 configVersion: v2
 log: {level: info, console: true, file: {path: "$RUN_DIR/milvus-backup.log"}}
 milvus:
+$au
   grpc: {address: 127.0.0.1, port: $MV_PORT}
   management: {endpoint: "http://127.0.0.1:$MG_PORT"}
   replicate: {rpcChannelName: "${CHAN_PREFIX}-replicate-msg"}
@@ -306,16 +339,21 @@ backup:
   pauseGC: false
 YAML
   )
-  if [ -n "${MILVUS_TOKEN:-}" ]; then local u=${MILVUS_TOKEN%%:*} p=${MILVUS_TOKEN#*:}
-    ( umask 077; sed -i "s|^milvus:|milvus:\n  user: \"$u\"\n  password: \"$p\"|" "$BK_DIR/backup.yaml" ); fi
 }
 mb(){ ( cd "$BK_DIR" && "$BIN" --config "$BK_DIR/backup.yaml" "$@" ); }
 
 # 当前实例：确保备份在本地有完整副本（删除前）
 if [ -z "$RESUME" ]; then
   read_conf || die 5 "读取 $NAME 的 ConfigMap/MinIO 凭据失败"
-  [ "${AUTH_ON:-false}" != true ] || [ -n "${MILVUS_TOKEN:-}" ] || die 5 "Milvus 开启了鉴权，需在环境变量 MILVUS_TOKEN=user:password 中提供凭据"
+  if [ "$AUTH_ON" = true ]; then
+    [[ ${MILVUS_TOKEN:-} == *:* ]] || die 5 "Milvus 开启了鉴权（authorizationEnabled=true）：需在环境变量 MILVUS_TOKEN=user:password（或 MILVUS_TOKEN_FILE）中提供 root/admin 凭据——恢复后要用它把 root 密码改回并校验 RBAC。尚未删除任何东西"
+  elif [ $RBAC_TEST = 1 ]; then die 5 "--rbac-test 只在开启鉴权的实例上有意义（authorizationEnabled=false）"; fi
   start_pf milvus minio etcd || die 5 "port-forward 失败"
+  if [ "$AUTH_ON" = true ]; then
+    python3 "$SCRIPT_DIR/probe.py" rbac-check --endpoint "http://127.0.0.1:$MV_PORT" \
+      || die 5 "MILVUS_TOKEN 不具备管理员权限或不可用：恢复/校验 RBAC 需要 root 或带 admin 角色的账号。尚未删除任何东西"
+    gate rbac_admin PASS
+  fi
   if [ -z "$BACKUP_NAME" ]; then
     write_backup_yaml
     mb list > "$RUN_DIR/backup_list_before.out" 2>&1 || true
@@ -341,7 +379,25 @@ fi
 V=$(python3 "$SCRIPT_DIR/s3tool.py" verify - - "backup/$BACKUP_NAME/" - "$LOCAL_EXPORT") || die 5 "本地备份副本校验失败: $V"
 log "本地备份副本 $LOCAL_EXPORT: $V"
 gate backup_ready "PASS ($BACKUP_NAME, $V)"
-{ echo "BACKUP_NAME=$BACKUP_NAME"; echo "LOCAL_EXPORT=$LOCAL_EXPORT"; echo "PROBE_COLLECTION=$PROBE"; echo "PROBE_PRE=$PROBE_PRE"; echo "PROBE_STATE=$PROBE_STATE"; } > "$RUN_DIR/restore.meta"
+if [ -n "$RESUME" ] && [ -f "$RUN_DIR/prev-restore.meta" ]; then
+  [ -n "$RBAC_PRE" ] || RBAC_PRE=$(sed -n 's/^RBAC_PRE=//p' "$RUN_DIR/prev-restore.meta")
+  [ "$(sed -n 's/^ACCEPT_RBAC_LOSS=//p' "$RUN_DIR/prev-restore.meta")" != 1 ] || ACCEPT_RBAC_LOSS=1
+fi
+# 备份里有没有 RBAC 元数据（只看数量）：开启鉴权而备份没有 → 必须由用户决定（SKILL.md 选项框），默认在删除任何东西之前退出
+RBAC_META=$(python3 "$SCRIPT_DIR/s3tool.py" rbacmeta - - "backup/$BACKUP_NAME/" - "$LOCAL_EXPORT") || true
+log "$RBAC_META"
+RBAC_IN_BACKUP=0; [[ $RBAC_META == *present=yes* ]] && RBAC_IN_BACKUP=1
+RBAC_LOSS=0
+if [ "$AUTH_ON" = true ] && [ $RBAC_IN_BACKUP = 0 ]; then
+  gate backup_rbac "MISSING ($RBAC_META)"
+  log "RBAC_DECISION_NEEDED: 实例开启了鉴权，但备份 $BACKUP_NAME 不含 RBAC 元数据（旧备份：升级脚本没带 --rbac，或备份不是本工具创建）。恢复后用户/角色/授权会丢失"
+  if [ $ACCEPT_RBAC_LOSS = 1 ]; then RBAC_LOSS=1; log "已指定 --accept-rbac-loss：仅恢复数据，RBAC 需手工重建，最终结果为部分恢复（退出码 14）"
+  else die 5 "备份不含 RBAC 元数据，且未指定 --accept-rbac-loss：为避免丢失用户/角色/授权，尚未删除任何东西。选项：仅恢复数据（加 --accept-rbac-loss，结果为部分恢复 rc=14）/ 取消，或改用含 RBAC 的备份（--backup）"; fi
+elif [ $RBAC_IN_BACKUP = 1 ]; then gate backup_rbac "PASS ($RBAC_META)"
+else gate backup_rbac "SKIP (鉴权未开启，备份无 RBAC)"
+fi
+{ echo "BACKUP_NAME=$BACKUP_NAME"; echo "LOCAL_EXPORT=$LOCAL_EXPORT"; echo "PROBE_COLLECTION=$PROBE"; echo "PROBE_PRE=$PROBE_PRE"; echo "PROBE_STATE=$PROBE_STATE"
+  echo "AUTH_ON=$AUTH_ON"; echo "RBAC_PRE=$RBAC_PRE"; echo "ACCEPT_RBAC_LOSS=$ACCEPT_RBAC_LOSS"; } > "$RUN_DIR/restore.meta"
 if [ -n "$RESUME" ] && [ -f "$RUN_DIR/prev-restore.meta" ]; then
   [ -n "$PROBE" ] || PROBE=$(sed -n 's/^PROBE_COLLECTION=//p' "$RUN_DIR/prev-restore.meta")
   [ -n "$PROBE_PRE" ] || PROBE_PRE=$(sed -n 's/^PROBE_PRE=//p' "$RUN_DIR/prev-restore.meta")
@@ -532,19 +588,70 @@ start_pf milvus minio etcd || die 12 "port-forward 失败"
 T_RS=$(date +%s)
 PU=$(python3 "$SCRIPT_DIR/s3tool.py" push "$S3_URL" "$BUCKET" "backup/$BACKUP_NAME/" "$CRED" "$LOCAL_EXPORT") || die 12 "导入备份到新 MinIO 失败: $PU"
 log "$PU"
+# 鉴权实例：新实例的 root 是默认密码（Milvus），用户的 MILVUS_TOKEN 多半还不能用——恢复期间用默认 root，恢复后（用户/角色/授权就位）再把 root 密码改回
+USER_TOKEN=${MILVUS_TOKEN:-}
+if [ "$AUTH_ON" = true ]; then
+  lg=$(python3 "$SCRIPT_DIR/probe.py" rbac-login --endpoint "http://127.0.0.1:$MV_PORT" || true); log "新实例登录探测: $lg"
+  case "$lg" in
+    "LOGIN default_root") export MILVUS_TOKEN=root:Milvus;;
+    "LOGIN token") ;;
+    *) die 12 "新实例上 MILVUS_TOKEN 与默认 root 凭据都无法登录，无法恢复 RBAC（旧实例已删除；修复后同一命令续做）";;
+  esac
+fi
 write_backup_yaml
 mb list > "$RUN_DIR/backup_list.out" 2>&1 || true
 grep -q "$BACKUP_NAME" "$RUN_DIR/backup_list.out" || { tail -20 "$RUN_DIR/backup_list.out"; die 12 "导入后 milvus-backup list 看不到 $BACKUP_NAME"; }
 set +e
-timeout "$RESTORE_TIMEOUT" "$BIN" --config "$BK_DIR/backup.yaml" restore -n "$BACKUP_NAME" --rebuild_index > "$RUN_DIR/backup_restore.out" 2>&1 < /dev/null
+# 备份含 RBAC 元数据就带 --rbac（milvus-backup 0.6.1：restore --rbac，默认 false；已存在的用户/角色/授权会被跳过，所以 root 密码不会被恢复）
+RB_FLAG=(); [ $RBAC_IN_BACKUP = 1 ] && RB_FLAG=(--rbac)
+timeout "$RESTORE_TIMEOUT" "$BIN" --config "$BK_DIR/backup.yaml" restore -n "$BACKUP_NAME" --rebuild_index "${RB_FLAG[@]}" > "$RUN_DIR/backup_restore.out" 2>&1 < /dev/null
 rrc=$?; set -e
 tail -25 "$RUN_DIR/backup_restore.out"
 [ $rrc = 0 ] || die 12 "milvus-backup restore 失败/超时（rc=$rrc，见 $RUN_DIR/backup_restore.out）"
 grep -Eqi 'fail|error' "$RUN_DIR/backup_restore.out" && ! grep -qi 'success' "$RUN_DIR/backup_restore.out" && die 12 "milvus-backup restore 输出含错误"
+# RBAC：把 root 密码改回 MILVUS_TOKEN（备份不含 root 密码），之后全部用用户的 MILVUS_TOKEN
+RBAC_RC=0; RBAC_RES="未开启鉴权"; RBAC_TEST_RES="未启用（--rbac-test）"; RBAC_NOTE=""
+if [ "$AUTH_ON" = true ]; then
+  export MILVUS_TOKEN=$USER_TOKEN
+  set +e; python3 "$SCRIPT_DIR/probe.py" rbac-fixroot --endpoint "http://127.0.0.1:$MV_PORT" | tee "$TMP/fixroot.out"; frc=${PIPESTATUS[0]}; set -e
+  RBAC_NOTE=$(grep -E '^RBAC FIXROOT' "$TMP/fixroot.out" | tail -1 || true)
+  if [ "$frc" != 0 ]; then   # 用户的凭据在新实例上不可用：后续步骤退回默认 root，RBAC 结果记为部分恢复
+    [ -z "$(python3 "$SCRIPT_DIR/probe.py" rbac-login --endpoint "http://127.0.0.1:$MV_PORT" | grep default_root)" ] || export MILVUS_TOKEN=root:Milvus
+    RBAC_RC=14
+  fi
+fi
 python3 "$SCRIPT_DIR/probe.py" load --endpoint "http://127.0.0.1:$MV_PORT" --collection '*' --wait 900 | tee "$RUN_DIR/load.out"
 [ "${PIPESTATUS[0]}" = 0 ] || die 12 "恢复后加载集合失败"
 RS_SECS=$(( $(date +%s) - T_RS ))
 gate restore_data "PASS (${RS_SECS}s, $(grep -c '^LOADED' "$RUN_DIR/load.out") 个集合)"
+
+# RBAC 校验：与升级/备份前的快照比较（没有快照时只能按备份元数据比数量）；不一致 = 部分恢复，不能报“完整恢复”
+if [ "$AUTH_ON" = true ]; then
+  step "7b. RBAC 校验（用户/角色/绑定/授权）"
+  set +e
+  if [ $RBAC_LOSS = 1 ]; then
+    RBAC_RES="未恢复：备份不含 RBAC 元数据，用户已选择仅恢复数据；用户/角色/授权需手工重建"; RBAC_RC=14
+    log "RBAC 未恢复（--accept-rbac-loss）"
+  elif [ -n "$RBAC_PRE" ] && [ -f "$RBAC_PRE" ]; then
+    python3 "$SCRIPT_DIR/probe.py" rbac-compare --endpoint "http://127.0.0.1:$MV_PORT" --pre "$RBAC_PRE" --out "$RUN_DIR/rbac_post.json" --wait 300 | tee "$TMP/rbac_cmp.out"; crc=${PIPESTATUS[0]}
+    RBAC_RES=$(grep -E '^RBAC (MATCH|MISMATCH|COMPARE ERROR)' "$TMP/rbac_cmp.out" | tail -1)
+    [ "$crc" = 0 ] || RBAC_RC=14
+  else
+    python3 "$SCRIPT_DIR/probe.py" rbac-snapshot --endpoint "http://127.0.0.1:$MV_PORT" --out "$RUN_DIR/rbac_post.json" | tee "$TMP/rbac_cmp.out"; crc=${PIPESTATUS[0]}
+    bu=$(echo "$RBAC_META" | sed -n 's/.*users=\([0-9]*\).*/\1/p'); br=$(echo "$RBAC_META" | sed -n 's/.*roles=\([0-9]*\).*/\1/p')
+    pu=$(python3 -c "import json,sys; s=json.load(open(sys.argv[1])); print(len(s['users']), len(s['roles']))" "$RUN_DIR/rbac_post.json" 2>/dev/null); set -- $pu
+    if [ "$crc" = 0 ] && [ "${1:-0}" -ge "${bu:-0}" ] && [ "${2:-0}" -ge "${br:-0}" ]; then
+      RBAC_RES="弱校验（没有备份前快照，只比较数量）：备份 [$RBAC_META]，恢复后 users=${1:-?} roles=${2:-?}"
+    else RBAC_RES="不一致/失败：备份 [$RBAC_META]，恢复后 users=${1:-?} roles=${2:-?}"; RBAC_RC=14; fi
+  fi
+  if [ $RBAC_TEST = 1 ]; then
+    python3 "$SCRIPT_DIR/probe.py" rbac-authtest --endpoint "http://127.0.0.1:$MV_PORT" --collection "${RBAC_TEST_COLL:-$PROBE}" --deny "$RBAC_TEST_DENY" | tee "$TMP/rbac_test.out"; trc=${PIPESTATUS[0]}
+    RBAC_TEST_RES=$(grep -E '^RBAC AUTHTEST (PASS|FAIL|ERROR)' "$TMP/rbac_test.out" | head -1)
+    [ "$trc" = 0 ] || RBAC_RC=14
+  fi
+  set -e
+  if [ "$RBAC_RC" = 0 ]; then gate rbac PASS; else gate rbac "PARTIAL/FAIL"; fi
+fi
 
 PROBE_RES="跳过（无探针参照）"
 if [ -n "$PROBE" ] && [ -n "$PROBE_PRE" ] && [ -f "$PROBE_PRE" ] && [ -f "$PROBE_STATE" ]; then
@@ -571,7 +678,7 @@ bash "$SCRIPT_DIR/snapshot_svc.sh" "$NS" "$NAME" > "$RUN_DIR/svc_after.txt"
 step "10. 报告"
 TOTAL=$(( $(date +%s) - T_START ))
 {
-echo "# Milvus 恢复报告 $NS/$NAME（$(date '+%F %T %Z')）"
+echo "# Milvus 恢复报告 $NS/$NAME（$(date '+%F %T %Z')）$([ "$RBAC_RC" = 0 ] || echo ' —— 部分恢复：数据已恢复，RBAC 未完整恢复')"
 echo
 echo "| 项目 | 结果 |"
 echo "|---|---|"
@@ -585,10 +692,16 @@ echo "| Service 恢复后 | $(tr '\n' ' ' < "$RUN_DIR/svc_after.txt") |"
 echo "| 删除前探针集合 | $(tr '\n' ' ' 2>/dev/null < "$RUN_DIR/count_before.out" || echo -) |"
 echo "| 恢复后集合 | $(grep '^LOADED' "$RUN_DIR/load.out" | sed 's/^LOADED //' | paste -sd';' -) |"
 echo "| 探针 | $PROBE_RES |"
+echo "| 鉴权 / RBAC | AUTH_ON=$AUTH_ON；备份 RBAC: ${RBAC_META:-无}；$RBAC_RES${RBAC_NOTE:+；$RBAC_NOTE} |"
+echo "| RBAC 应用用户权限测试 | $RBAC_TEST_RES |"
 echo "| 用时 删除 / 重建 / 导入+恢复+加载 | ${DEL_SECS}s / ${RC_SECS}s / ${RS_SECS}s |"
 echo "| 总用时 | ${TOTAL}s |"
 for g in "${GATE_ORDER[@]}"; do echo "| 关卡 $g | ${GATE[$g]} |"; done
 echo
 echo "备份点之后写入的数据已丢失；本地备份副本保留在 $LOCAL_EXPORT（确认无需后可手动删除）。"
 } | tee "$RUN_DIR/report.md"
+if [ "$RBAC_RC" != 0 ]; then
+  log "ONESHOT PARTIAL: 数据与镜像已恢复，但 RBAC（用户/角色/授权）未完整恢复或与备份时不一致——不能报告为完整恢复；见上方 RBAC 行，需手工重建/核对 RBAC"
+  exit "$RBAC_RC"
+fi
 log "ONESHOT OK"

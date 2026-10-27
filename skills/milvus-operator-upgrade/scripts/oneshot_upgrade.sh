@@ -3,15 +3,19 @@
 # 用法: oneshot_upgrade.sh <NS> --check-only [--name CR] [--target-tag v3.0.3] [TARGET_IMAGE]   # 只读预检，不建任何对象
 #       oneshot_upgrade.sh <NS> <TARGET_IMAGE> [--name CR] [--backup-bin PATH] [--probe-collection C] [--export-dir DIR]
 #                         [--no-export] [--operator-ns ONS] [--upgrade-timeout 1200] [--token-ttl 3h] [--workdir DIR] [--yes]
-# 退出码: 0 成功 | 2 参数/需要选择 CR | 3 环境/前置(admin、NS、CR) | 4 权限/隔离自检 | 5 预检(健康/版本/Service/拉镜像)
-#         6 备份 | 7 升级(超时/CrashLoop/拉取失败) | 8 升级后校验 | 9 探针不一致 | 130 中断/未确认
+#                         [--rbac-test [--rbac-test-collection C] [--rbac-test-deny list_users,create_collection]]
+# 鉴权（authorizationEnabled=true）：环境变量 MILVUS_TOKEN=user:password（或 MILVUS_TOKEN_FILE=<600 权限文件>），账号须为 root/admin。
+#   备份始终带 milvus-backup --rbac（用户/角色/授权）；升级前后各取一份 RBAC 快照比较；可选 --rbac-test 用 MILVUS_TEST_TOKEN（应用用户）验证权限。
+# 退出码: 0 成功 | 2 参数/需要选择 CR | 3 环境/前置(admin、NS、CR) | 4 权限/隔离自检 | 5 预检(健康/版本/Service/拉镜像/鉴权凭据无管理员权限)
+#         6 备份(含 RBAC 元数据缺失) | 7 升级(超时/CrashLoop/拉取失败) | 8 升级后校验 | 9 探针不一致 | 14 升级后 RBAC 不一致 | 130 中断/未确认
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SA=milvus-upgrader
-usage(){ sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; }
+usage(){ sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ---------- 参数 ----------
 NS=""; TARGET_IMAGE=""; NAME=""; BACKUP_BIN="${MILVUS_BACKUP_BIN:-}"; PROBE=""; ONS=""; YES=0; EXPORT_DIR=""; NO_EXPORT=0
+RBAC_TEST=0; RBAC_TEST_COLL=""; RBAC_TEST_DENY=list_users
 CHECK_ONLY=0; TARGET_TAG=v3.0.3; UPGRADE_TIMEOUT=1200; PULL_TIMEOUT=900; TOKEN_TTL=3h; WORKBASE=/root/milvus-upgrade
 ADMIN_KC=${ADMIN_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}
 pos=()
@@ -27,6 +31,9 @@ while [ $# -gt 0 ]; do
     --pull-timeout) PULL_TIMEOUT=${2:?}; shift 2;;
     --token-ttl) TOKEN_TTL=${2:?}; shift 2;;
     --workdir) WORKBASE=${2:?}; shift 2;;
+    --rbac-test) RBAC_TEST=1; shift;;
+    --rbac-test-collection) RBAC_TEST_COLL=${2:?}; shift 2;;
+    --rbac-test-deny) RBAC_TEST_DENY=${2:?}; shift 2;;
     --check-only) CHECK_ONLY=1; shift;;
     --target-tag) TARGET_TAG=${2:?}; shift 2;;
     --yes|-y) YES=1; shift;;
@@ -42,6 +49,7 @@ if [ $CHECK_ONLY = 1 ]; then
   ca=(upgrade "${pos[0]}" --target-tag "$TARGET_TAG" --workdir "$WORKBASE")
   [ -z "$NAME" ] || ca+=(--name "$NAME"); [ -z "$BACKUP_BIN" ] || ca+=(--backup-bin "$BACKUP_BIN")
   [ -z "$ONS" ] || ca+=(--operator-ns "$ONS"); [ ${#pos[@]} -lt 2 ] || ca+=(--target-image "${pos[1]}")
+  [ $RBAC_TEST = 0 ] || ca+=(--rbac-test)
   ADMIN_KUBECONFIG=$ADMIN_KC exec python3 "$SCRIPT_DIR/check.py" "${ca[@]}"
 fi
 [ ${#pos[@]} -eq 2 ] || { usage; exit 2; }
@@ -68,6 +76,17 @@ die(){ local rc=$1; shift; echo "[$(ts)] !!!!! 失败(rc=$rc): $*" >&2; exit "$r
 kadm(){ kubectl --kubeconfig "$ADMIN_KC" "$@"; }          # root/管理员：仅限 NS 存在性、operator 定位、RBAC 增删、签 token、(必要时)读指定 secret
 ksa(){ kubectl --kubeconfig "$SA_KC" "$@"; }               # 其余全部操作
 PF_PIDS=(); RBAC_APPLIED=0; PULL_PODS=()
+
+# 凭据只来自环境变量；MILVUS_TOKEN_FILE / MILVUS_TEST_TOKEN_FILE 指向用户自己在 master 上创建的 600 权限文件（内容 user:password，不经聊天）
+load_token(){ # load_token <变量名> <文件变量名>
+  local v=$1 fv=$2 f m
+  if [ -z "${!v:-}" ] && [ -n "${!fv:-}" ]; then
+    f=${!fv}; [ -r "$f" ] || die 5 "$fv 指向的文件不可读: $f"
+    m=$(stat -c %a "$f" 2>/dev/null || echo 777); [[ $m =~ ^[0-7]00$ ]] || die 5 "$f 权限为 $m：必须是 600 或 400（chmod 600），避免凭据被其他用户读取"
+    printf -v "$v" '%s' "$(head -n1 "$f")"
+  fi
+  export "${v?}"
+}
 
 cleanup(){
   local rc=$?
@@ -112,6 +131,15 @@ NOTICE
 if [ "$YES" != 1 ]; then
   [ -r /dev/tty ] || die 130 "非交互运行必须加 --yes（agent 须先向用户展示风险提示并获得确认）"
   read -r -p "确认执行请输入 yes: " ans < /dev/tty; [ "$ans" = yes ] || die 130 "用户未确认"
+fi
+
+# ---------- 凭据（环境变量 / 600 权限文件） ----------
+load_token MILVUS_TOKEN MILVUS_TOKEN_FILE
+[ $RBAC_TEST = 0 ] || load_token MILVUS_TEST_TOKEN MILVUS_TEST_TOKEN_FILE
+if [ $RBAC_TEST = 1 ]; then
+  [ -n "${MILVUS_TEST_TOKEN:-}" ] && [[ ${MILVUS_TEST_TOKEN:-} == *:* ]] || die 2 "--rbac-test 需要环境变量 MILVUS_TEST_TOKEN=user:password（应用用户，或 MILVUS_TEST_TOKEN_FILE）"
+  RBAC_TEST_COLL=${RBAC_TEST_COLL:-$PROBE}
+  [ -n "$RBAC_TEST_COLL" ] || die 2 "--rbac-test 需要 --rbac-test-collection（或 --probe-collection）：该用户应有查询权限的集合"
 fi
 
 # ---------- 0. 环境 ----------
@@ -320,7 +348,13 @@ fi
 unset AK SK
 ETCD_EXT=$(cr '{.spec.dependencies.etcd.external}'); STOR_EXT=$(cr '{.spec.dependencies.storage.external}')
 log "备份配置: bucket=$BUCKET dataRoot=$DATA_ROOT backupRoot=backup etcdRoot=$ETCD_ROOT minio=$MINIO_ADDR:$MINIO_PORT ssl=$MINIO_SSL chanPrefix=$CHAN_PREFIX MQ=${MQ:-?} etcdExternal=${ETCD_EXT:-false} storageExternal=${STOR_EXT:-false} 鉴权=${AUTH_ON:-false}"
-if [ "${AUTH_ON:-false}" = true ] && [ -z "${MILVUS_TOKEN:-}" ]; then die 6 "Milvus 开启了鉴权，需在环境变量 MILVUS_TOKEN=user:password 中提供凭据"; fi
+AUTH_ON=$(echo "${AUTH_ON:-false}" | tr 'A-Z' 'a-z')
+if [ "$AUTH_ON" = true ]; then
+  [[ ${MILVUS_TOKEN:-} == *:* ]] || die 5 "Milvus 开启了鉴权（authorizationEnabled=true）：需在环境变量 MILVUS_TOKEN=user:password（或 MILVUS_TOKEN_FILE）中提供 root/admin 凭据，备份需要它读取用户/角色/授权。未做任何变更"
+  log "鉴权: 开启；将用 MILVUS_TOKEN（用户 ${MILVUS_TOKEN%%:*}，密码不显示）并始终带 --rbac 备份用户/角色/授权"
+else
+  log "鉴权: 未开启；仍带 --rbac 备份（无自定义用户时 RBAC 元数据只含默认项）"
+fi
 
 start_pf_all(){
   pf milvus "svc/$SVC" 19530 41953 || die 6 "port-forward Milvus 失败"; MV_PORT=$PF_PORT
@@ -337,6 +371,26 @@ PROBE_RES="跳过（未提供 --probe-collection）"
 if [ $ALREADY = 0 ]; then
 step "5. 端口转发 + 探针(升级前)"
 start_pf_all
+RBAC_RES="未开启鉴权，未取 RBAC 快照"; RBAC_BK_RES="备份带 --rbac（鉴权未开启，未校验元数据内容）"; RBAC_TEST_RES="未启用（--rbac-test）"; RBAC_RC=0
+if [ "$AUTH_ON" = true ]; then
+  command -v python3 >/dev/null || die 5 "鉴权开启时 master 需要 python3（RBAC 快照/校验）"
+  step "5b. RBAC：校验凭据的管理员能力 + 升级前快照（用户/角色/绑定/授权；不含密码）"
+  python3 "$SCRIPT_DIR/probe.py" rbac-check --endpoint "http://127.0.0.1:$MV_PORT" \
+    || die 5 "MILVUS_TOKEN 不具备管理员权限或不可用：备份/恢复 RBAC 需要 root 或带 admin 角色的账号。未做任何变更"
+  gate rbac_admin PASS
+  python3 "$SCRIPT_DIR/probe.py" rbac-snapshot --endpoint "http://127.0.0.1:$MV_PORT" --out "$RUN_DIR/rbac_pre.json" | tee "$TMP/rbac_pre.out" \
+    || die 5 "RBAC 快照失败"
+  RBAC_PRE_COUNTS=$(sed -n 's/^RBAC SNAPSHOT: //p' "$TMP/rbac_pre.out")
+  RBAC_RES="升级前 $RBAC_PRE_COUNTS"
+  gate rbac_pre "PASS ($RBAC_PRE_COUNTS)"
+  if [ $RBAC_TEST = 1 ]; then
+    python3 "$SCRIPT_DIR/probe.py" rbac-authtest --endpoint "http://127.0.0.1:$MV_PORT" --collection "$RBAC_TEST_COLL" --deny "$RBAC_TEST_DENY" | tee "$TMP/rbac_test_pre.out" \
+      || die 5 "RBAC 权限测试在升级前就不通过（应用用户的权限/测试参数有问题，先修复；未做任何变更）"
+    RBAC_TEST_RES="升级前 $(sed -n 's/^RBAC AUTHTEST PASS: //p' "$TMP/rbac_test_pre.out")"
+    gate rbac_authtest_pre PASS
+  fi
+elif [ $RBAC_TEST = 1 ]; then die 5 "--rbac-test 只在开启鉴权的实例上有意义（authorizationEnabled=false）"
+fi
 if [ -n "$PROBE" ]; then
   if command -v python3 >/dev/null; then
     python3 "$SCRIPT_DIR/probe.py" pre --endpoint "http://127.0.0.1:$MV_PORT" --collection "$PROBE" --state "$RUN_DIR/probe_state.json" --out "$RUN_DIR/probe_pre.json" \
@@ -372,10 +426,15 @@ done
 BVER=$("$BIN" --help 2>&1 | head -1 || true); log "milvus-backup: $BIN  ($BVER)"
 BACKUP_NAME="pre_upgrade_${TS}"
 CRED_AK=$(sed -n 1p "$CRED"); CRED_SK=$(sed -n 2p "$CRED")
+# 鉴权凭据写入 YAML 双引号字符串：转义 \ 和 "，不经 sed（密码里有 | & \ 也安全）；文件 600
+yq(){ local x=$1; x=${x//\\/\\\\}; x=${x//\"/\\\"}; printf '%s' "$x"; }
+AUTH_YAML=""
+if [ -n "${MILVUS_TOKEN:-}" ]; then AUTH_YAML=$(printf '  user: "%s"\n  password: "%s"' "$(yq "${MILVUS_TOKEN%%:*}")" "$(yq "${MILVUS_TOKEN#*:}")"); fi
 ( umask 077; cat > "$BK_DIR/backup.yaml" <<YAML
 configVersion: v2
 log: {level: info, console: true, file: {path: "$RUN_DIR/milvus-backup.log"}}
 milvus:
+$AUTH_YAML
   grpc: {address: 127.0.0.1, port: $MV_PORT}
   management: {endpoint: "http://127.0.0.1:$MG_PORT"}
   replicate: {rpcChannelName: "${CHAN_PREFIX}-replicate-msg"}
@@ -400,15 +459,14 @@ backup:
   pauseGC: true
 YAML
 )
-if [ -n "${MILVUS_TOKEN:-}" ]; then u=${MILVUS_TOKEN%%:*}; p=${MILVUS_TOKEN#*:}
-  ( umask 077; sed -i "s|^milvus:|milvus:\n  user: \"$u\"\n  password: \"$p\"|" "$BK_DIR/backup.yaml" ); fi
-unset CRED_AK CRED_SK
+unset CRED_AK CRED_SK AUTH_YAML
 cd "$BK_DIR"
 mb(){ "$BIN" --config "$BK_DIR/backup.yaml" "$@"; }
 T_BK=$(date +%s)
 mb check > "$RUN_DIR/backup_check.out" 2>&1 || log "WARN: milvus-backup check 返回非 0（继续，以 create 结果为准）"
 tail -15 "$RUN_DIR/backup_check.out"
-if ! mb create -n "$BACKUP_NAME" > "$RUN_DIR/backup_create.out" 2>&1; then tail -30 "$RUN_DIR/backup_create.out"; die 6 "milvus-backup create 失败"; fi
+# 始终带 --rbac（milvus-backup 0.6.1：create --rbac，默认 false）：备份用户、角色、授权、权限组
+if ! mb create -n "$BACKUP_NAME" --rbac > "$RUN_DIR/backup_create.out" 2>&1; then tail -30 "$RUN_DIR/backup_create.out"; die 6 "milvus-backup create 失败"; fi
 tail -15 "$RUN_DIR/backup_create.out"
 grep -qi "success" "$RUN_DIR/backup_create.out" || die 6 "milvus-backup create 未报告成功（见 $RUN_DIR/backup_create.out）"
 if grep -qi "etcd client is not initialized" "$RUN_DIR/backup_create.out"; then log "注: 'etcd client is not initialized' 为已知可忽略告警"; fi
@@ -424,6 +482,20 @@ OBJ=$(python3 "$SCRIPT_DIR/s3tool.py" ls "$S3_URL" "$BUCKET" "backup/$BACKUP_NAM
 log "MinIO $BUCKET/backup/$BACKUP_NAME/: $OBJ"
 [[ $OBJ =~ OBJECTS=([0-9]+)\ BYTES=([0-9]+) ]] && [ "${BASH_REMATCH[1]}" -gt 0 ] || die 6 "MinIO 中 backup/$BACKUP_NAME/ 下没有对象"
 BK_BYTES=${BASH_REMATCH[2]}
+# RBAC 元数据校验：backup_meta.json 的 rbac_meta（只取数量，不输出内容；其中含密码哈希，导出副本与 MinIO 备份都要妥善保管）
+RBAC_META=$(python3 "$SCRIPT_DIR/s3tool.py" rbacmeta "$S3_URL" "$BUCKET" "backup/$BACKUP_NAME/" "$CRED") || die 6 "读取备份的 RBAC 元数据失败: $RBAC_META"
+log "$RBAC_META"
+if [ "$AUTH_ON" = true ]; then
+  rb_n(){ echo "$RBAC_META" | sed -n "s/.*$1=\([0-9]*\).*/\1/p"; }
+  [[ $RBAC_META == *present=yes* ]] || { gate backup_rbac "FAIL (备份没有 RBAC 元数据)"; die 6 "开启了鉴权但备份里没有 RBAC 元数据（用户/角色/授权未被备份）。检查 MILVUS_TOKEN 是否为 root/admin、milvus-backup 版本是否为 0.6.1，见 $RUN_DIR/backup_create.out；未升级"; }
+  pre_u=$(python3 -c "import json,sys; s=json.load(open(sys.argv[1])); print(len(s['users']), len(s['roles']))" "$RUN_DIR/rbac_pre.json")
+  set -- $pre_u   # 备份里的用户/角色数不得少于备份前快照（服务端可能多带内置项）
+  { [ "$(rb_n users)" -ge "$1" ] && [ "$(rb_n roles)" -ge "$2" ]; } || { gate backup_rbac "FAIL (备份 users/roles=$(rb_n users)/$(rb_n roles) 与快照 $pre_u 不符)"; die 6 "备份中的 RBAC 用户/角色数与备份前快照不一致（$RBAC_META，快照 users roles=$pre_u）；未升级"; }
+  gate backup_rbac "PASS ($RBAC_META)"
+  RBAC_BK_RES="备份带 --rbac；$RBAC_META"
+else
+  RBAC_BK_RES="备份带 --rbac（鉴权未开启）；$RBAC_META"
+fi
 cd "$RUN_DIR"
 T_BK_DONE=$(( $(date +%s) - T_BK ))
 gate backup "PASS ($BACKUP_NAME, ${T_BK_DONE}s, $OBJ)"
@@ -446,7 +518,10 @@ fi
 { echo "NS=$NS"; echo "CR=$NAME"; echo "BACKUP_NAME=$BACKUP_NAME"; echo "SOURCE_IMAGE=$CUR_IMAGE"; echo "TARGET_IMAGE=$TARGET_IMAGE"
   echo "EXPORT_DIR=$([ $NO_EXPORT = 0 ] && echo "$EXPORT_DIR")"; echo "PROBE_COLLECTION=$PROBE"
   echo "PROBE_PRE=$([ -f "$RUN_DIR/probe_pre.json" ] && echo "$RUN_DIR/probe_pre.json")"
-  echo "PROBE_STATE=$([ -f "$RUN_DIR/probe_state.json" ] && echo "$RUN_DIR/probe_state.json")"; } > "$RUN_DIR/backup.meta"
+  echo "PROBE_STATE=$([ -f "$RUN_DIR/probe_state.json" ] && echo "$RUN_DIR/probe_state.json")"
+  echo "AUTH_ON=$AUTH_ON"; echo "RBAC_BACKED_UP=$([[ $RBAC_META == *present=yes* ]] && echo 1 || echo 0)"
+  echo "RBAC_PRE=$([ -f "$RUN_DIR/rbac_pre.json" ] && echo "$RUN_DIR/rbac_pre.json")"
+  echo "RBAC_TEST=$RBAC_TEST"; echo "RBAC_TEST_COLLECTION=$RBAC_TEST_COLL"; echo "RBAC_TEST_DENY=$RBAC_TEST_DENY"; } > "$RUN_DIR/backup.meta"
 pf_stop
 fi
 
@@ -521,6 +596,21 @@ if [ -n "$PROBE" ]; then
   fi
 fi
 
+if [ "$AUTH_ON" = true ] && [ -f "$RUN_DIR/rbac_pre.json" ]; then
+  step "9b. RBAC 升级后比较（用户/角色/绑定/授权）"
+  pf milvus "svc/$SVC" 19530 41953 || die 9 "port-forward Milvus 失败"; MV_PORT=$PF_PORT
+  set +e
+  python3 "$SCRIPT_DIR/probe.py" rbac-compare --endpoint "http://127.0.0.1:$MV_PORT" --pre "$RUN_DIR/rbac_pre.json" --out "$RUN_DIR/rbac_post.json" --wait 300 | tee "$TMP/rbac_post.out"; rrc=${PIPESTATUS[0]}
+  if [ $RBAC_TEST = 1 ] && [ "$rrc" = 0 ]; then
+    python3 "$SCRIPT_DIR/probe.py" rbac-authtest --endpoint "http://127.0.0.1:$MV_PORT" --collection "$RBAC_TEST_COLL" --deny "$RBAC_TEST_DENY" | tee "$TMP/rbac_test_post.out"; rrc=${PIPESTATUS[0]}
+    RBAC_TEST_RES="$RBAC_TEST_RES；升级后 $(grep -E '^RBAC AUTHTEST' "$TMP/rbac_test_post.out" | head -1)"
+  fi
+  set -e
+  pf_stop
+  RBAC_RES="$RBAC_RES；升级后 $(grep -E '^RBAC (MATCH|MISMATCH|COMPARE ERROR)' "$TMP/rbac_post.out" | tail -1)"
+  if [ "$rrc" != 0 ]; then gate rbac "FAIL"; RBAC_RC=14; else gate rbac PASS; fi
+fi
+
 # ---------- 10. 报告 ----------
 step "10. 报告"
 TOTAL=$(( $(date +%s) - T_START ))
@@ -537,10 +627,17 @@ echo "| Service 升级前 | $(tr '\n' ' ' < "$RUN_DIR/svc_snapshot.txt") |"
 echo "| Service 升级后 | $(tr '\n' ' ' < "$RUN_DIR/svc_after.txt") |"
 if [ -n "${BACKUP_NAME:-}" ]; then echo "| 备份 | $BACKUP_NAME @ ${BUCKET:-?}/backup/ |"; echo "| 备份本地导出 | $EXPORT_RES |"; else echo "| 备份 | 已是目标版本，本次未备份 |"; fi
 echo "| 探针 | $PROBE_RES |"
+echo "| 鉴权 / RBAC | AUTH_ON=$AUTH_ON；$RBAC_RES |"
+echo "| RBAC 备份 | ${RBAC_BK_RES:-已是目标版本，本次未备份} |"
+echo "| RBAC 应用用户权限测试 | $RBAC_TEST_RES |"
 echo "| 升级用时（patch→Healthy） | ${UP_SECS}s |"
 echo "| 总用时 | ${TOTAL}s |"
 for g in "${GATE_ORDER[@]}"; do echo "| 关卡 $g | ${GATE[$g]} |"; done
 echo
 if [ -n "${BACKUP_NAME:-}" ]; then echo "回滚：3.x 不可改回旧镜像；一键恢复: bash $SCRIPT_DIR/oneshot_restore.sh $NS $CUR_IMAGE --name $NAME --backup $BACKUP_NAME（会删除当前实例及其数据，备份点之后写入的数据丢失）。"; fi
 } | tee "$RUN_DIR/report.md"
+if [ "$RBAC_RC" != 0 ]; then
+  log "ONESHOT PARTIAL: 升级已完成，但 RBAC（用户/角色/授权）升级后与升级前不一致或应用用户权限测试失败，不能算完整成功（见上方 RBAC DIFF / AUTHTEST）。备份已含 RBAC，必要时可走一键恢复"
+  exit "$RBAC_RC"
+fi
 log "ONESHOT OK"

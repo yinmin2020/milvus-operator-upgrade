@@ -5,8 +5,9 @@
   s3tool.py pull <endpoint> <bucket> <prefix> <cred> <local_dir>    把 prefix 下所有对象下载到 local_dir/<key>，写 local_dir/MANIFEST
   s3tool.py push <endpoint> <bucket> <prefix> <cred> <local_dir>    按 local_dir/MANIFEST 把对象上传回 bucket（key 不变；桶不存在则创建）
   s3tool.py verify - - <prefix> - <local_dir>                       只校验本地副本（MANIFEST 中 prefix 下对象的大小与 sha256）
+  s3tool.py rbacmeta <endpoint|-> <bucket|-> <prefix> <cred|-> [local_dir]   读备份 meta/backup_meta.json 的 rbac_meta，只打印数量：RBAC_META present=yes|no users= roles= grants= groups=（无 local_dir 时读 MinIO；不输出密码哈希）
 MANIFEST 每行: <size> <sha256> <key>。出错退出 3。"""
-import datetime, hashlib, hmac, os, re, sys
+import datetime, hashlib, hmac, json, os, re, sys
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
@@ -83,8 +84,27 @@ def read_manifest(local, prefix, check=True):
     return items
 
 
+def rbac_summary(raw):
+    """backup_meta.json 里的 rbac_meta（milvus-backup --rbac 写入）：只输出数量，不输出任何内容（含密码哈希）。"""
+    m = json.loads(raw.decode('utf-8')).get('rbac_meta') or {}
+    n = lambda k: len(m.get(k) or [])
+    if n('users') + n('roles') + n('grants') + n('privilege_groups') == 0:
+        return 'RBAC_META present=no users=0 roles=0 grants=0 groups=0'
+    return 'RBAC_META present=yes users=%d roles=%d grants=%d groups=%d' % (n('users'), n('roles'), n('grants'), n('privilege_groups'))
+
+
 def main():
     cmd, ep, bucket, prefix, credf = sys.argv[1:6]
+    if cmd == 'rbacmeta':
+        # rbacmeta <endpoint|-> <bucket|-> <backup/NAME/> <cred|-> [本地导出目录]：有本地目录时读本地 <dir>/<prefix>meta/backup_meta.json，否则读 MinIO
+        key = prefix.rstrip('/') + '/meta/backup_meta.json'
+        if len(sys.argv) > 6:
+            path = os.path.join(os.path.abspath(sys.argv[6]), key)
+            if not os.path.isfile(path):
+                print('RBAC_META present=unknown (没有 %s)' % key); return 3
+            print(rbac_summary(open(path, 'rb').read())); return 0
+        with S3(ep, bucket, credf).req('GET', key) as r:
+            print(rbac_summary(r.read())); return 0
     if cmd == 'verify':
         items = read_manifest(os.path.abspath(sys.argv[6]), prefix)
         print('VERIFIED OBJECTS=%d BYTES=%d' % (len(items), sum(s for _, s in items))); return 0

@@ -9,7 +9,7 @@
       最后一行 CHECK_RESULT rc=N（0 全部通过 | 2 需要选择 CR | 3 环境/NS 不存在 |
       4 只缺 milvus-backup（前置条件；打印 NEEDS install_backup、官方下载链接与期望 sha256，由用户自行下载并告知位置）| 5 有 FAIL 项）。
 """
-import argparse, fcntl, glob, json, os, re, shutil, subprocess, sys
+import argparse, fcntl, glob, json, os, re, shutil, socket, stat, subprocess, sys, time
 
 ap = argparse.ArgumentParser()
 ap.add_argument('mode', choices=['upgrade', 'restore'])
@@ -20,6 +20,7 @@ ap.add_argument('--target-image', default='')
 ap.add_argument('--backup-bin', default=os.environ.get('MILVUS_BACKUP_BIN', ''))
 ap.add_argument('--workdir', default='/root/milvus-upgrade')
 ap.add_argument('--operator-ns', default='')
+ap.add_argument('--rbac-test', action='store_true')
 a = ap.parse_args()
 KC = os.environ.get('ADMIN_KUBECONFIG') or os.environ.get('KUBECONFIG') or os.path.expanduser('~/.kube/config')
 ITEMS = []; FACTS = []
@@ -104,6 +105,64 @@ mode = spec.get('mode', 'standalone')
 img = comp.get('image', ''); cur_img = st.get('currentImage', '') or img
 fact('cr', name); fact('cr_mode', mode); fact('current_image', img); fact('current_version', vs(ver(img)))
 item('cr', 'PASS', '%s/%s (%s)' % (a.ns, name, mode))
+
+# 4b. 鉴权 / RBAC：开启鉴权时必须提供 root/admin 凭据（备份与恢复 RBAC 都要它）
+def read_token(var, fvar):
+    """凭据只来自环境变量；<VAR>_FILE 指向用户自己创建的 600/400 权限文件（第一行 user:password）。返回 (token, 问题说明)"""
+    t = os.environ.get(var, '')
+    if t:
+        return t, ''
+    f = os.environ.get(fvar, '')
+    if not f:
+        return '', ''
+    try:
+        mode_ = stat.S_IMODE(os.stat(f).st_mode)
+        if mode_ & 0o077:
+            return '', '%s 权限为 %o：必须是 600 或 400（chmod 600）' % (f, mode_)
+        return open(f).readline().strip(), ''
+    except OSError as e:
+        return '', '%s 不可读: %s' % (f, e.strerror)
+
+auth_on = str((((spec.get('config') or {}).get('common') or {}).get('security') or {}).get('authorizationEnabled', False)).lower() == 'true'
+fact('auth_enabled', 'true' if auth_on else 'false')
+tok, tok_issue = read_token('MILVUS_TOKEN', 'MILVUS_TOKEN_FILE')
+if auth_on:
+    if ':' not in tok:
+        item('milvus_token', 'FAIL', tok_issue or 'Milvus 开启了鉴权（authorizationEnabled=true）：需要 root/admin 凭据——在 master 的环境变量 MILVUS_TOKEN=user:password 或 MILVUS_TOKEN_FILE=<600 权限文件> 提供（备份/恢复 RBAC 需要读写用户、角色、授权）。凭据只能由用户在自己的终端里设置，不要发到聊天里')
+    else:
+        # 只读验证：临时 port-forward 到 Milvus，用 REST 检查该账号能否读取全部 RBAC（不创建任何对象）
+        sock = socket.socket(); sock.bind(('127.0.0.1', 0)); lport = sock.getsockname()[1]; sock.close()
+        pf = subprocess.Popen(['kubectl', '--kubeconfig', KC, '-n', a.ns, 'port-forward', '--address', '127.0.0.1', 'svc/%s-milvus' % name, '%d:19530' % lport],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            ok_pf = False
+            for _ in range(30):
+                time.sleep(0.5)
+                try:
+                    socket.create_connection(('127.0.0.1', lport), timeout=1).close(); ok_pf = True; break
+                except OSError:
+                    if pf.poll() is not None:
+                        break
+            if not ok_pf:
+                item('milvus_token', 'WARN', '已提供 MILVUS_TOKEN（用户 %s），但无法 port-forward 到 Milvus，未能验证管理员权限（正式运行会在改动前再验证）' % tok.split(':', 1)[0])
+            else:
+                env = dict(os.environ, MILVUS_TOKEN=tok)
+                p = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'probe.py'), 'rbac-check', '--endpoint', 'http://127.0.0.1:%d' % lport],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, env=env, timeout=120)
+                msg = (p.stdout.strip().splitlines() or [''])[-1]
+                if p.returncode == 0:
+                    item('milvus_token', 'PASS', msg)
+                elif '无法访问' in msg:
+                    item('milvus_token', 'WARN', '未能验证管理员权限：' + msg[:160])
+                else:
+                    item('milvus_token', 'FAIL', msg[:240] + '。备份/恢复 RBAC 需要 root 或带 admin 角色的账号；未做任何变更')
+        finally:
+            pf.terminate()
+    if a.rbac_test:
+        tt, tt_issue = read_token('MILVUS_TEST_TOKEN', 'MILVUS_TEST_TOKEN_FILE')
+        item('rbac_test_token', 'PASS' if ':' in tt else 'FAIL', ('应用用户 %s（--rbac-test）' % tt.split(':', 1)[0]) if ':' in tt else (tt_issue or '--rbac-test 需要 MILVUS_TEST_TOKEN=user:password（或 MILVUS_TEST_TOKEN_FILE）'))
+else:
+    item('auth', 'INFO', '未开启鉴权（authorizationEnabled=false）；备份仍带 --rbac' + ('；--rbac-test 在未开启鉴权的实例上无意义' if a.rbac_test else ''))
 
 # 5. 状态
 status = st.get('status', '')
@@ -332,9 +391,19 @@ else:
         ed = m.get('EXPORT_DIR', '')
         man = os.path.join(ed, 'MANIFEST') if ed else ''
         nobj = sum(1 for _ in open(man)) if man and os.path.isfile(man) else 0
+        # 备份是否含 RBAC 元数据（读本地导出的 backup_meta.json，只统计数量，不输出内容）
+        rb = 'unknown'
+        bm = os.path.join(ed, 'backup', m.get('BACKUP_NAME', ''), 'meta', 'backup_meta.json') if ed else ''
+        if bm and os.path.isfile(bm):
+            try:
+                r_ = json.load(open(bm)).get('rbac_meta') or {}
+                rb = 'yes' if any(r_.get(x_) for x_ in ('users', 'roles', 'grants', 'privilege_groups')) else 'no'
+            except Exception:
+                rb = 'unknown'
+        m['_rbac'] = rb
         metas.append(m)
-        print('BACKUP index=%d name=%s source_image=%s target_image=%s export=%s objects=%d probe=%s meta=%s' % (
-            len(metas), m.get('BACKUP_NAME', ''), m.get('SOURCE_IMAGE', ''), m.get('TARGET_IMAGE', ''), ed or '-', nobj, m.get('PROBE_COLLECTION', '') or '-', f))
+        print('BACKUP index=%d name=%s source_image=%s target_image=%s export=%s objects=%d probe=%s rbac=%s meta=%s' % (
+            len(metas), m.get('BACKUP_NAME', ''), m.get('SOURCE_IMAGE', ''), m.get('TARGET_IMAGE', ''), ed or '-', nobj, m.get('PROBE_COLLECTION', '') or '-', rb, f))
     fact('backups', len(metas))
     if metas:
         b = metas[0]
@@ -345,6 +414,13 @@ else:
              '，master 本地导出副本可用' if ok else '，无本地导出副本：恢复时会先从当前 MinIO 导出，MinIO 数据已损坏则无法恢复'))
     else:
         item('backup', 'WARN', '%s 下没有本 CR 的升级备份记录(backup.meta)；恢复时将使用当前 MinIO 中最新的 pre_upgrade_* 备份，恢复镜像需人工指定' % runs)
+    if metas and auth_on and metas[0]['_rbac'] == 'unknown':
+        item('backup_rbac', 'WARN', '实例开启了鉴权，但无法确认最近备份 %s 是否含 RBAC（没有本地导出副本）；正式运行会在删除任何东西之前检查，备份不含 RBAC 时退出 5 并要求选择' % metas[0].get('BACKUP_NAME', ''))
+    elif metas and auth_on and metas[0]['_rbac'] != 'yes':
+        print('RBAC_DECISION_NEEDED backup=%s rbac=%s' % (metas[0].get('BACKUP_NAME', ''), metas[0]['_rbac']))
+        item('backup_rbac', 'WARN', '实例开启了鉴权，但最近备份 %s 不含 RBAC 元数据（rbac=%s）：恢复只能恢复数据，用户/角色/授权丢失，结果为部分恢复（退出码 14）。需用户选择“仅恢复数据（--accept-rbac-loss）/取消”，不加 --accept-rbac-loss 时正式运行会在删除任何东西之前退出 5' % (metas[0].get('BACKUP_NAME', ''), metas[0]['_rbac']))
+    elif metas and metas[0]['_rbac'] == 'yes':
+        item('backup_rbac', 'PASS', '最近备份 %s 含 RBAC 元数据' % metas[0].get('BACKUP_NAME', ''))
     item('restore_impact', 'INFO', '恢复会删除 %s/%s 当前实例及其 etcd/MinIO/PVC 数据，备份点之后的数据全部丢失' % (a.ns, name))
 
 fails = [n for n, s_, _ in ITEMS if s_ == 'FAIL']

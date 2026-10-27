@@ -26,7 +26,7 @@ description: 在 milvus-operator 部署的 Milvus（命名空间里有 milvus.io
 - 没有这类工具时，列出带编号的选项，让用户回复编号。
 - 能用选项就不要让用户自由输入；只有「自定义镜像」「master 地址未知」「milvus-backup 路径」这类确实无法枚举的值才让用户输入（路径不是机密，可用 allowCustom/自定义输入）。
 - 不要一次问多个问题；按 A → 连接 → B →（缺 milvus-backup 时 B2）→ C → D → 执行 → 关闭连接 的顺序推进。预检（B）不需要确认，直接执行；B2 必须用选项让用户告知 milvus-backup 的位置。
-- **选项框/输入框不是保密通道**：宿主的选项工具（AskUserQuestion、request_user_input 等）不加密，用户的选择和输入会和聊天消息一样进入对话上下文和会话记录。因此框里只能出现非敏感内容（命名空间、CR 名、镜像地址、备份名、确认/取消）。**绝不**用选项框、输入框或聊天向用户索要密码、token、AK/SK、kubeconfig 内容。
+- **选项框/输入框不是保密通道**：宿主的选项工具（AskUserQuestion、request_user_input 等）不加密，用户的选择和输入会和聊天消息一样进入对话上下文和会话记录。因此框里只能出现非敏感内容（命名空间、CR 名、镜像地址、备份名、确认/取消）。**绝不**用选项框、输入框或聊天向用户索要密码、token、AK/SK、kubeconfig 内容（包括 Milvus 的 `MILVUS_TOKEN` / `MILVUS_TEST_TOKEN`，见「Milvus 鉴权与 RBAC」）。
 - **选项框消失或没有回答**：本轮结束时框会消失，用户没有作答，一律视为**未确认/取消**，不得猜测默认值继续，更不得据此启动升级或恢复。用户下一条消息回来后，从当前步骤重新弹出同一个问题；风险确认（D）必须在启动前的同一轮里拿到明确的「确认」。
 
 ## 升级流程
@@ -49,13 +49,13 @@ description: 在 milvus-operator 部署的 Milvus（命名空间里有 milvus.io
   - `PREREQ …`：仅缺 milvus-backup 时出现，给出 master 架构、官方下载链接、期望 sha256 和两种放置方式。
   - `SUGGEST target_image=<当前仓库>:v3.0.3`、`SUGGEST official_image=milvusdb/milvus:v3.0.3`。
   - 一张人读表格，最后一行 `CHECK_RESULT rc=N`。
-- 检查项：master 工具、NS、管理员能否建临时 SA/Role/token、CR 及模式、健康（Healthy + MilvusUpdated）、paused、operator 版本、MQ/依赖、Pod Ready、Service 类型与 NodePort（与 CR serviceType 是否一致）、imagePullSecrets、root 运行说明、milvus-backup 是否可用（架构须与 master 一致，架构不符视为未安装）、master 磁盘、NS 锁、版本门槛（官方文档要求当前 ≥ 2.5.16，2.6.0-rc 不支持；目标 3.x 时本 skill 要求当前 ≥ 2.6，已验证 2.6.25 → 3.0.3 @ operator 1.3.12）、目标版本高于当前。
+- 检查项：master 工具、NS、管理员能否建临时 SA/Role/token、CR 及模式、健康（Healthy + MilvusUpdated）、paused、operator 版本、MQ/依赖、Pod Ready、Service 类型与 NodePort（与 CR serviceType 是否一致）、imagePullSecrets、root 运行说明、milvus-backup 是否可用（架构须与 master 一致，架构不符视为未安装）、master 磁盘、NS 锁、版本门槛（官方文档要求当前 ≥ 2.5.16，2.6.0-rc 不支持；目标 3.x 时本 skill 要求当前 ≥ 2.6，已验证 2.6.25 → 3.0.3 @ operator 1.3.12）、目标版本高于当前、鉴权与 RBAC 凭据（`auth_enabled`、`milvus_token`，见「Milvus 鉴权与 RBAC」；开启鉴权但没有可用的 root/admin 凭据 = FAIL）。
 - `rc=0`：全部 PASS（WARN/INFO 不阻断），把表格转述给用户，进入 C。
 - `rc=4` 且有 `NEEDS install_backup`：其余全部通过，只缺前置条件 milvus-backup（`CHECK_ITEM milvus_backup MISSING`），做 B2。
 - `CHECK_ITEM milvus_backup_sha256 WARN`（找到的文件不在已知 0.6.1 清单中）：转述后用选项问「仍然使用（未经验证）/ 取消（换官方 0.6.1，回到 B2）」，选前者才进入 C。
 - `rc=2` 且有 `NEED_CR_NAME candidates=a,b`：用选项让用户选 CR（每个候选一个选项），加 `--name` 重跑 B。
 - `rc=3`：NS 不存在、没有 Milvus CR 或环境不满足，把说明转述给用户，停止。
-- `rc=5`：有 FAIL 项，转述 FAIL 项和修复建议，**不要进入 C**。此时若 milvus_backup 也是 MISSING，可以先做 B2，但 FAIL 项修复前仍不能继续。
+- `rc=5`：有 FAIL 项，转述 FAIL 项和修复建议，**不要进入 C**。`milvus_token` FAIL 时告诉用户：在 master 上用自己的终端设置 `MILVUS_TOKEN`（见下节），agent 不得代为设置或索要，然后重跑 B。此时若 milvus_backup 也是 MISSING，可以先做 B2，但 FAIL 项修复前仍不能继续。
 
 ### B2. 前置条件 milvus-backup（仅 B 报 MISSING 时）
 **绝不**代用户从 GitHub 或任何外网下载 milvus-backup 或其他二进制（本机、master、浏览器都不行），也不要自己在用户磁盘上搜找安装包；只用用户告知的位置。
@@ -94,10 +94,11 @@ description: 在 milvus-operator 部署的 Milvus（命名空间里有 milvus.io
    3.0 镜像默认非 root 用户启动会 Permission denied/CrashLoop。若安全策略不允许 root 容器，请取消。
    Service 为 NodePort/LoadBalancer 时把 CR 的 serviceType 固定为同类型（nodePort 漂移则改回快照值）。
 2. 在 [<NS>] 临时创建 SA/Role/RoleBinding "milvus-upgrader" 和短期 token，结束（含失败）自动删除；之后所有操作都用该 SA 身份执行。
-3. 用 milvus-backup 做全量备份 pre_upgrade_<时间戳>，写入该 Milvus 的 MinIO 桶（backup/ 前缀），不自动删除；
-   并完整导出一份到 master 本地（MinIO 被删后仍可用 oneshot_restore.sh 恢复；会先检查磁盘空间）。
+3. 用 milvus-backup 做全量备份 pre_upgrade_<时间戳>（始终带 --rbac：用户、角色、授权一并备份；备份含密码哈希，仅存放在 MinIO 和 master 本地导出里），
+   写入该 Milvus 的 MinIO 桶（backup/ 前缀），不自动删除；并完整导出一份到 master 本地（MinIO 被删后仍可用 oneshot_restore.sh 恢复；会先检查磁盘空间）。
 4. 在 [<NS>] 临时创建拉取检查 Pod（milvus-upgrader-pullcheck-N），固定到 Milvus 所在节点，用完即删。
 5. 3.0 无法通过改回镜像回滚，只能从备份恢复到新实例；升级期间 Milvus 有短暂停机（standalone 实测 patch→Healthy 约 65 秒，镜像已预拉取）。
+6. 若实例开启了鉴权：使用环境变量 MILVUS_TOKEN（root/admin 账号）读取/备份 RBAC，升级前后各取一份 RBAC 快照比较；不一致时结果为“部分”（退出码 14），不报告成功。
 除上述对象外，不修改 [<NS>] 内其他资源，也不在任何其他命名空间创建或修改对象（由 SA 权限在 API Server 层强制）。
 ==========================================
 ```
@@ -160,6 +161,21 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 
 **结束时必须关闭连接**：升级/恢复结束（成功、失败或用户取消）后，运行 `connect.sh --close <master>`（Windows `connect.ps1 -Close <master>`）。注意：后台运行的升级脚本不依赖这条连接，关闭不影响 master 上的任务；但轮询结束前不要关闭。
 
+## Milvus 鉴权与 RBAC（authorizationEnabled=true）
+
+问题背景：恢复会删除 CR 和 etcd/MinIO 的 PVC，而 Milvus 的用户、角色、授权存在 etcd 里。不备份 RBAC，回滚后这些全部丢失（issue #1）。因此：
+
+- **备份/恢复始终带 `--rbac`**（milvus-backup 的 `create --rbac` / `restore --rbac`）。未开启鉴权时同样带，对空的 RBAC 无害。
+- **开启鉴权时必须有 root/admin 凭据**：读写用户、角色、授权需要管理员权限。凭据**只来自 master 上的环境变量**，格式 `user:password`：
+  - `MILVUS_TOKEN=root:<密码>`；或 `MILVUS_TOKEN_FILE=<文件>`（文件权限必须是 600/400，第一行 `user:password`，由用户自己在终端里创建）。
+  - 凭据不能经聊天、选项框、命令行参数传递；日志、报告、命令行都不会出现密码。用户要在自己的终端里 `ssh master`，`export MILVUS_TOKEN=…` 后自己运行脚本；或先写好 600 权限的 token 文件，再让 agent 带 `MILVUS_TOKEN_FILE=<路径>` 运行。agent 看不到文件内容。
+  - `--check-only` 会验证：开启鉴权但没有凭据、文件权限过宽、账号不是管理员 → `milvus_token` FAIL（rc=5），升级/恢复在改动前拒绝启动。
+  - 恢复后 milvus-backup 不会恢复 root 的密码（root 已存在，被跳过），脚本会用 `MILVUS_TOKEN` 的密码把 root 改回备份时的值，再继续。
+- **验证**：升级前（及恢复前）用 REST 快照用户、角色、用户-角色绑定、授权（`probe.py rbac-snapshot`，600 权限，只含名称和授权条目，不含密码）；升级后/恢复后再比较（`rbac-compare`）。不一致 = 关卡 FAIL，退出码 14（升级：`ONESHOT PARTIAL`；恢复：部分恢复），**绝不报告“完整恢复/成功”**。
+- **可选应用用户检查**：`--rbac-test [--rbac-test-collection <集合>] [--rbac-test-deny list_users,create_collection]`，另需环境变量 `MILVUS_TEST_TOKEN=appuser:password`（或 `MILVUS_TEST_TOKEN_FILE`）。脚本用该自定义应用用户在升级后/恢复后做一次允许的操作（对集合 query）和被禁止的操作（默认 `list_users`，可选 `create_collection`），允许成功且禁止被拒才 PASS；用户权限过大（禁止的操作成功）也算 FAIL。
+- **旧备份没有 RBAC 元数据**（在本修复之前做的备份）：恢复只能恢复数据。脚本在**删除任何东西之前**检查，开启鉴权且备份不含 RBAC 时退出 5 并打印 `RBAC_DECISION_NEEDED`；预检也会给 `backup_rbac` WARN 和同样的标记。此时必须用**选项框**问用户（见恢复流程 D）。
+- 升级脚本在备份后检查 `backup_meta.json` 里确有 `rbac_meta`（开启鉴权时，读 MinIO 中的备份，与 `--no-export` 无关），没有则退出 6，不会改镜像。
+
 ## 前置条件：milvus-backup 0.6.1
 
 - 本 skill 只验证过 milvus-backup **0.6.1**，skill 不携带也不下载它；需要用户从官方 release（https://github.com/zilliztech/milvus-backup/releases/tag/v0.6.1）下载 `milvus-backup_0.6.1_Linux_x86_64.tar.gz` 或 `milvus-backup_0.6.1_Linux_arm64.tar.gz`（与 master 架构一致）。
@@ -176,7 +192,7 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
    ```
 2. D 确认后后台启动。nohup 必须是一条独立的命令，不要接在 `&&` 链后面，否则 ssh 会一直挂到脚本结束：
    ```bash
-   <SSH> 'nohup bash /root/milvus-upgrade/skill/scripts/oneshot_upgrade.sh <NS> <TARGET_IMAGE> --yes [--name <CR>] [--backup-bin <路径>] [--probe-collection <集合>] > /root/milvus-upgrade/last_run.out 2>&1 < /dev/null &'
+   <SSH> 'nohup bash /root/milvus-upgrade/skill/scripts/oneshot_upgrade.sh <NS> <TARGET_IMAGE> --yes [--name <CR>] [--backup-bin <路径>] [--probe-collection <集合>] [--rbac-test …] > /root/milvus-upgrade/last_run.out 2>&1 < /dev/null &'
    ```
 3. 每 30 到 60 秒轮询一次，直到出现 `ONESHOT_RESULT rc=<N> run_dir=<目录>`：
    ```bash
@@ -186,7 +202,7 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 4. `rc=0` 时，读取 `<run_dir>/report.md` 并把结果表发给用户，内容包括：镜像前后、CR 状态、Service/nodePort 前后、备份名和位置、探针结果、各关卡、耗时。同时提醒用户保留备份，直到业务确认无误。
 5. 无论结果如何（成功、失败、取消），最后关闭连接（见「连接方式」）。
 
-可选参数（用户没提就不问）：`--name <CR>`、`--backup-bin <路径>`（默认依次查找 `/root/milvus-upgrade/milvus-backup`（B2 放置/安装位置）、`/root/milvus-backup/milvus-backup`、`/usr/local/bin`、`PATH`，以及 `/root/milvus-upgrade/` 或 `/root/` 下的 `milvus-backup_*_Linux_*.tar.gz`；架构与 master 不符的自动跳过）、`--probe-collection <已 load 的集合>`、`--export-dir <目录>` / `--no-export`（跳过后一键恢复只能依赖 MinIO 里仍在的备份）、`--operator-ns`、`--upgrade-timeout 1200`、`--pull-timeout 900`、`--token-ttl 3h`、`--workdir /root/milvus-upgrade`、`--target-tag v3.0.3`（仅 `--check-only`）。
+可选参数（用户没提就不问）：`--rbac-test`（及 `--rbac-test-collection`、`--rbac-test-deny`，见「Milvus 鉴权与 RBAC」）、`--name <CR>`、`--backup-bin <路径>`（默认依次查找 `/root/milvus-upgrade/milvus-backup`（B2 放置/安装位置）、`/root/milvus-backup/milvus-backup`、`/usr/local/bin`、`PATH`，以及 `/root/milvus-upgrade/` 或 `/root/` 下的 `milvus-backup_*_Linux_*.tar.gz`；架构与 master 不符的自动跳过）、`--probe-collection <已 load 的集合>`、`--export-dir <目录>` / `--no-export`（跳过后一键恢复只能依赖 MinIO 里仍在的备份）、`--operator-ns`、`--upgrade-timeout 1200`、`--pull-timeout 900`、`--token-ttl 3h`、`--workdir /root/milvus-upgrade`、`--target-tag v3.0.3`（仅 `--check-only`）。
 
 下列信息自动获取，不要问用户：CR 名（NS 内只有一个时）、standalone 或 cluster、当前镜像、MQ 类型、operator 位置、版本和镜像、imagePullSecrets、Milvus 所在节点、MinIO 和 etcd 的地址、bucket 与 rootPath（读 `<CR>` ConfigMap 的 user.yaml，不用 CR 里的 chart 值）、Service 快照。
 
@@ -198,11 +214,13 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 4. 预检（与 `--check-only` 相同的门槛，再查一遍）：CR 为 Healthy、`MilvusUpdated=True`、未 paused；版本门槛（当前 ≥ 2.5.16、非 2.6.0-rc、不降级、升 3.x 时当前 ≥ 2.6）；Service 类型与 CR serviceType；保存 Service 快照和 cr-before.yaml。CR 已是目标镜像且 Healthy 时进入 ALREADY 模式，只做校验。
 5. 镜像拉取检查：在每个 Milvus 节点上建一个临时 Pod，用 nodeName 固定，带 CR 的 imagePullSecrets，运行 `/bin/sh -c "exit 0"`。出现 ImagePullBackOff 或 ErrImagePull 即失败。
 6. 以 SA 身份 port-forward：只绑定 127.0.0.1，本地端口避开 2379（41953/41909/49000/42379，被占用时自动顺延）。运行升级前探针。
-7. milvus-backup：依次 check、`create -n pre_upgrade_<TS>`（输出必须含 success）、list、get，并用 `s3tool.py`（标准库 SigV4）列出 MinIO `backup/<name>/` 下的对象（对象数必须大于 0）。
+5b. 鉴权实例：`probe.py rbac-check`（账号须为管理员，否则退出 5）、`rbac-snapshot`（`rbac_pre.json`）、可选 `rbac-authtest`（升级前基线）。
+7. milvus-backup：依次 check、`create --rbac -n pre_upgrade_<TS>`（输出必须含 success）、list、get，并用 `s3tool.py`（标准库 SigV4）列出 MinIO `backup/<name>/` 下的对象（对象数必须大于 0）；开启鉴权时再用 `s3tool.py rbacmeta` 确认备份含 RBAC 元数据（否则退出 6）。
 7b. 导出：检查磁盘（可用 ≥ 备份大小×1.2 + 1GiB），`s3tool.py pull` 到导出目录并写 MANIFEST（size/sha256/key），对象数必须一致；写 `backup.meta`（NS、CR、备份名、源/目标镜像、导出目录、探针集合与探针结果路径），供恢复脚本自动发现。
 8. 升级：按需固定 serviceType，nodePort 有漂移时按快照 patch 回去；用一次 merge patch 改镜像并设置 securityContext。之后每 10 秒检查一次，每 30 秒打印一次进度，直到 Healthy、`MilvusUpdated=True`、currentImage 等于目标镜像、所有 Pod 都换成新镜像并 Ready。CrashLoop 且重启次数 ≥ 3 时打印 `logs --previous` 并退出 7；patch 300 秒后仍处于 ImagePullBackOff 或整体超时（默认 1200 秒）也退出 7。
 9. 校验：运行 `verify.sh`，加 `milvus.io/reconcile` 注解，等 40 秒后再运行一次 `verify.sh`。
 10. 升级后探针：行数必须一致，top-k id 必须一致。
+10b. 鉴权实例：`rbac-compare`（与升级前快照逐项比较）和可选 `rbac-authtest`；不一致 → 退出 14。
 11. 报告：生成 `report.md`，打印 `ONESHOT OK`。
 最后由 trap 清理（成功或失败都会执行）：结束 port-forward（按 PID，再按本次 SA kubeconfig 路径兜底 pkill，并在日志打印残留数，应为 0），删除拉取检查 Pod，删除 SA/Role/RoleBinding（token 随 SA 一起失效），删除临时目录（kubeconfig、MinIO 凭据、milvus-backup 配置和解压出的二进制）。最后打印 `ONESHOT_RESULT`。
 
@@ -229,11 +247,12 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 | 2 | 参数错误，或需要选择 CR（`NEED_CR_NAME`） | 用选项让用户选 CR，加 `--name` 重跑 |
 | 3 | 环境问题：没有 kubectl 或 admin 权限、NS 或 CR 不存在、同一 NS 已有一次运行持有锁 | 按提示修复后重跑 |
 | 4 | SA 权限超出预期，例如存在绑定到 `system:serviceaccounts` 的集群级权限 | 停止，交给集群管理员排查，不要绕过 |
-| 5 | 预检失败：不健康、paused、版本门槛、Service 与 CR 不一致、镜像拉不下来、探针集合未 load | 按日志修复，未做任何变更 |
-| 6 | 备份失败，或找不到 milvus-backup | 未升级；缺 milvus-backup 时回到 B2（前置条件：给出下载链接，用选项问放置位置）后重跑，其他按日志修复存储 |
+| 5 | 预检失败：不健康、paused、版本门槛、Service 与 CR 不一致、镜像拉不下来、探针集合未 load、开启鉴权但缺少 root/admin 的 `MILVUS_TOKEN` 或账号无管理员权限 | 按日志修复，未做任何变更 |
+| 6 | 备份失败（含开启鉴权时备份里没有 RBAC 元数据），或找不到 milvus-backup | 未升级；缺 milvus-backup 时回到 B2（前置条件：给出下载链接，用选项问放置位置）后重跑，其他按日志修复存储 |
 | 7 | 升级失败：超时、CrashLoop、拉取失败 | CR 已改镜像。看日志里的 `logs --previous`，对照附录「坑」处理；不要把镜像改回旧版，用户决定回滚时走「一键恢复」 |
 | 8 | 升级后校验失败，例如 nodePort 被改 | 看 verify 的 diff，用 `kubectl patch svc` 按 svc_snapshot.txt 改回 |
 | 9 | 探针不一致 | 停止写入流量，保留现场，由用户决定是否走「一键恢复」 |
+| 14 | 升级后 RBAC（用户/角色/授权）与升级前不一致，或应用用户检查失败。结果是 `ONESHOT PARTIAL` | 不要报告成功；转述 `RBAC DIFF` 行（只有名称，无密码），由用户决定修复或走「一键恢复」 |
 | 130 | 中断，或未确认 | 无需处理（trap 已清理） |
 
 失败后只要报告退出码、日志中的最后一个错误，以及 run_dir。脚本可以重复执行：修复问题后用同样的参数再跑；CR 已经是目标版本且 Healthy 时会进入 ALREADY 模式，只做校验。
@@ -250,7 +269,7 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 ```bash
 <SSH> 'bash /root/milvus-upgrade/skill/scripts/oneshot_restore.sh <NS> --check-only [--name <CR>]'
 ```
-输出 `CHECK`/`CHECK_ITEM` 行、每个可用备份一行 `BACKUP index=N name=… source_image=… target_image=… export=… objects=… probe=… meta=…`（最新在前）、`SUGGEST restore_image=…`（最新备份的升级前镜像）、`SUGGEST backup=…`、表格和 `CHECK_RESULT rc=N`。检查项包括：CR、当前状态（仅 INFO，恢复不要求健康）、依赖（外部 etcd/对象存储/MQ 或 rocksmq existingClaim 时 FAIL，不支持一键恢复）、Service、milvus-backup、磁盘、锁、备份（本地导出副本可用为 PASS）。CR 不存在但有上次中断的恢复记录时提示续跑。`rc` 含义同升级预检（`rc=4` 同样走 B2，再重跑）；`NEED_CR_NAME` 时用选项选 CR。
+输出 `CHECK`/`CHECK_ITEM` 行、每个可用备份一行 `BACKUP index=N name=… source_image=… target_image=… export=… objects=… probe=… meta=…`（最新在前）、`rbac=yes|no|unknown`（该备份是否含 RBAC 元数据，只数数量）、`SUGGEST restore_image=…`（最新备份的升级前镜像）、`SUGGEST backup=…`、表格和 `CHECK_RESULT rc=N`。检查项包括：鉴权与 `MILVUS_TOKEN`（同升级）、CR、当前状态（仅 INFO，恢复不要求健康）、依赖（外部 etcd/对象存储/MQ 或 rocksmq existingClaim 时 FAIL，不支持一键恢复）、Service、milvus-backup、磁盘、锁、备份（本地导出副本可用为 PASS）。CR 不存在但有上次中断的恢复记录时提示续跑。`rc` 含义同升级预检（`rc=4` 同样走 B2，再重跑）；`NEED_CR_NAME` 时用选项选 CR。
 
 **C. 选择恢复点**：用结构化选项列出 `BACKUP` 行（每个备份一个选项，标签写「`<name>` → 镜像 `<source_image>`」，第一项标「推荐」），外加「自定义恢复镜像」。恢复镜像默认取所选备份的 `source_image`，不要另外问 etcd/MinIO 等镜像（沿用原 CR）。没有 `BACKUP` 行时，脚本会用 MinIO 中最新的 `pre_upgrade_*`，这时恢复镜像需要用户在选项「沿用当前仓库 `<repo>:<升级前 tag>`」与「自定义输入」之间选择。
 
@@ -261,7 +280,8 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 1. 【不可逆】删除 [<NS>] 中当前的 Milvus CR 及其全部数据：Milvus Pod、Service（随后按原 nodePort 重建）、
    该实例的 etcd 与 MinIO（helm release 由 operator 卸载）以及这些组件挂载的 PVC。删除前当前实例里的数据将永久丢失。
 2. 【数据丢失】只能恢复到备份时间点：备份之后写入/删除/修改的数据全部丢失（含升级后写入的数据）。
-3. 用原 CR 配置在旧镜像上重建（etcd/MinIO 等依赖沿用原 CR 里的配置与镜像，不需要另外准备；容器以 root 运行：
+3. 开启鉴权时：RBAC（用户/角色/授权）随备份一起用 --rbac 恢复；备份不含 RBAC 时（见 D2）它们会丢失，结果为部分恢复。root 密码按 MILVUS_TOKEN 改回。
+   用原 CR 配置在旧镜像上重建（etcd/MinIO 等依赖沿用原 CR 里的配置与镜像，不需要另外准备；容器以 root 运行：
    securityContext runAsUser=0——官方文档没有这一步，因为原数据文件属主是 root；保持 serviceType 与原 nodePort），等待 Healthy 后
    把备份（优先使用 master 本地导出副本；若只在 MinIO 中则先导出到 master 本地再删除）导入新 MinIO，用 milvus-backup restore
    恢复全部集合并重建索引、加载集合，与备份时记录的探针（行数 + top-5）比对。
@@ -270,35 +290,42 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 =======================================================
 ```
 
+**D2. RBAC 决策（仅当 B 输出 `RBAC_DECISION_NEEDED`，即实例开启了鉴权而所选备份不含 RBAC 元数据时）**：先把 C 的恢复点换成含 RBAC 的备份（若有，`BACKUP` 行 `rbac=yes`）。没有时，必须用结构化选项问，且在确认 D 之前问：
+- 选项 1：`取消，不恢复`（推荐；不加 `--yes`，什么也不删）
+- 选项 2：`继续，仅恢复数据（用户/角色/授权会丢失，需之后手工重建，结果为部分恢复 rc=14）`——只有选了它才在启动命令里加 `--accept-rbac-loss`。
+选项框消失或没有回答 = 取消。没有 `--accept-rbac-loss` 时脚本在删除之前退出 5，不会做任何破坏性操作。选了继续后，最终报告也必须按“部分恢复”转述，不得说“完整恢复”。
+
 **启动**（与升级相同的传输、后台启动和轮询方式）：
 ```bash
-<SSH> 'nohup bash /root/milvus-upgrade/skill/scripts/oneshot_restore.sh <NS> <RESTORE_IMAGE> --yes [--name <CR>] [--backup <名>] > /root/milvus-upgrade/last_restore.out 2>&1 < /dev/null &'
+<SSH> 'nohup bash /root/milvus-upgrade/skill/scripts/oneshot_restore.sh <NS> <RESTORE_IMAGE> --yes [--name <CR>] [--backup <名>] [--accept-rbac-loss] [--rbac-test …] > /root/milvus-upgrade/last_restore.out 2>&1 < /dev/null &'
 ```
-轮询直到 `ONESHOT_RESULT rc=<N> run_dir=<目录>`，rc=0 时转述 `<run_dir>/report.md`；结束后（无论结果）关闭连接。实测（standalone、5000 行、镜像已在节点上）：删除 49 秒、重建到 Healthy 65 秒、导入+restore+load 25 秒，总计约 3 分 25 秒；nodePort 保持不变，探针行数与 top-5 一致，备份后写入的行按预期丢失。
+轮询直到 `ONESHOT_RESULT rc=<N> run_dir=<目录>`，rc=0 时转述 `<run_dir>/report.md`（rc=14 也要转述，但按“部分恢复”，列出 RBAC 差异）；结束后（无论结果）关闭连接。实测（standalone、5000 行、镜像已在节点上）：删除 49 秒、重建到 Healthy 65 秒、导入+restore+load 25 秒，总计约 3 分 25 秒；nodePort 保持不变，探针行数与 top-5 一致，备份后写入的行按预期丢失。
 
-可选参数：`--name <CR>`、`--backup <名>`（默认：本 NS/CR 最近一次升级 run 的 `backup.meta`，其次 `milvus-backup list` 中最新的 `pre_upgrade_*`）、`--backup-bin`、`--probe-collection`（默认取 backup.meta 中记录的探针集合）、`--restore-timeout 3600`、`--healthy-timeout 1200`、`--pull-timeout`、`--token-ttl 4h`、`--workdir`、`--yes`。
+可选参数：`--accept-rbac-loss`（仅在用户于 D2 选了“继续，仅恢复数据”时）、`--rbac-test`（含 `--rbac-test-collection`、`--rbac-test-deny`）、`--name <CR>`、`--backup <名>`（默认：本 NS/CR 最近一次升级 run 的 `backup.meta`，其次 `milvus-backup list` 中最新的 `pre_upgrade_*`）、`--backup-bin`、`--probe-collection`（默认取 backup.meta 中记录的探针集合）、`--restore-timeout 3600`、`--healthy-timeout 1200`、`--pull-timeout`、`--token-ttl 4h`、`--workdir`、`--yes`。
 
 **脚本内部顺序**（任一步失败即停止并清理）：
 0. 环境检查、NS 锁（与升级共用 `.lock-<NS>`，两者不能并发）。
 1. 第一阶段 SA（只读 milvuses）发现 CR；CR 不存在时进入**续跑模式**（见下）。
 2. 预检：保存 cr-original.json/yaml、svc_snapshot.txt；etcd/storage/MQ 为外部依赖或 rocksmq 用 existingClaim 时拒绝（退出 5）。
-3. 选择备份并确认可用：优先本地导出副本；没有则先从现网 MinIO 导出到 `<run_dir>/backup_export`；用 MANIFEST 校验 size/sha256（关卡 `backup_ready`）。记录删除前行数（count_before）。**到此为止未做任何删除。**
+3. 选择备份并确认可用：优先本地导出副本；没有则先从现网 MinIO 导出到 `<run_dir>/backup_export`；用 MANIFEST 校验 size/sha256（关卡 `backup_ready`）。记录删除前行数（count_before）；开启鉴权时 `rbac-check`、`rbac-snapshot`（删除前的 RBAC 快照）、检查备份含 RBAC 元数据（不含且没有 `--accept-rbac-loss` → 退出 5）。**到此为止未做任何删除。**
 4. 生成 cr-recreate.json：去掉 status/运行时字段和 `milvus.io/*`、last-applied 注解，镜像换成 RESTORE_IMAGE，securityContext 设为 root；其余配置（serviceType、依赖配置及其镜像、资源等）原样沿用现有 CR，不需要用户提供。
 5. 计算实例 PVC：该实例 Pod（instance/release 标签为 `<CR>`、`<CR>-etcd`、`<CR>-minio`、`<CR>-pulsar`、`<CR>-kafka`）挂载的 PVC 及带这些标签的 PVC；任一 PVC 被其他 Pod 使用则停止。
 6. 第二阶段 RBAC（restore 模式）+ 隔离自检：可 delete `milvuses/<CR>`、create milvuses、按名字 delete 上述 PVC；对其他 CR/PVC、deployments、secrets、exec、kube-system、default、nodes 必须为 no，外加两项真实 Forbidden 测试。
 7. 镜像拉取检查（RESTORE_IMAGE）。
 8. 删除：把 CR 的依赖 deletionPolicy 改为 Delete 并开启 pvcDeletion，删除 CR，等待 CR/Pod/sts/deploy/PVC 消失（最长 900 秒）；CR 消失 90 秒后 PVC 仍在则由 SA 按名字删除（关卡 `delete`）。
 9. 重建：create cr-recreate.json，等待 Healthy 且镜像为 RESTORE_IMAGE；按快照把 nodePort patch 回原值（关卡 `recreate`）。
-10. 数据恢复：`s3tool.py push` 把本地副本导入新 MinIO，`milvus-backup list` 确认可见，`milvus-backup restore -n <备份> --rebuild_index`（超时 RESTORE_TIMEOUT），然后 load 全部集合（关卡 `restore_data`）。
+10. 数据恢复：`s3tool.py push` 把本地副本导入新 MinIO，`milvus-backup list` 确认可见，`milvus-backup restore -n <备份> --rebuild_index --rbac`（超时 RESTORE_TIMEOUT；备份不含 RBAC 时不带 --rbac）；用 `rbac-login` 判断新实例是用备份密码还是默认 root:Milvus，再 `rbac-fixroot` 把 root 改回 MILVUS_TOKEN 的密码，然后 load 全部集合（关卡 `restore_data`）。
 11. 探针：与升级前探针比对行数和 top-5 id。
+11b. RBAC：`rbac-compare` 与删除前快照比较（无快照时只比较数量），可选 `rbac-authtest`；不一致或备份不含 RBAC → 关卡 `rbac` FAIL，退出 14。
 12. verify.sh 两次（中间加 reconcile 注解），生成 report.md，打印 `ONESHOT OK`；trap 清理与升级相同。
 
-**退出码**：0 成功；2 参数/需要 `--name`；3 环境；4 隔离自检失败；5 预检失败（**未删除任何东西**）；10 删除阶段失败；11 重建失败；12 数据恢复失败；13 校验失败；9 探针不一致；130 中断/未确认。
+**退出码**：0 成功；2 参数/需要 `--name`；3 环境；4 隔离自检失败；5 预检失败（**未删除任何东西**）；10 删除阶段失败；11 重建失败；12 数据恢复失败；13 校验失败；9 探针不一致；**14 部分恢复**（数据已恢复，但 RBAC 未恢复或与删除前不一致，报告标题为“部分恢复”，打印 `ONESHOT PARTIAL`，**不得说完整恢复**）；130 中断/未确认。
 
 **续跑模式**：删除之后（退出码 10/11/12）失败时，日志会打印续跑提示。修复原因后用同样的参数重跑即可：脚本发现 CR 已不存在，会使用最近一次 `runs/<NS>-restore-*/cr-recreate.json` 和 restore.meta 继续重建与恢复，无需再次确认风险提示（NS、镜像、备份不变时）。
 
 **仍需用户决定的事项**（都用选项问，除连接回退外，用户不需要手动执行任何命令）：
 - 是否回滚、回到哪个备份/镜像（C）以及最终确认（D）。（连接 master 时用户可能需要在系统弹窗或自己的终端里输入一次密码，见「连接方式」。）
+- 开启鉴权时，备份不含 RBAC 的情况下是否“仅恢复数据”（D2 选项框：取消 / 继续并加 `--accept-rbac-loss`）。
 - 备份之后写入的数据无法找回；若需要，必须在恢复前由业务自行导出。
 - 外部 etcd/对象存储/MQ、rocksmq existingClaim 的实例不支持一键恢复，预检会 FAIL，需要人工按 milvus-backup 文档处理。
 - 恢复会 load 所有恢复出的集合；原来未 load 的集合需要业务自行 release。
