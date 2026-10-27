@@ -8,7 +8,7 @@ npx skills@latest add yinmin2020/milvus-operator-upgrade --skill milvus-operator
 
 Replace `milvus-operator-upgrade` with the published GitHub repository name.
 
-You do **not** need to publish this repository to npm. The `skills` package on npm is only the installer.
+The `skills` CLI installs from this GitHub repository.
 
 ## Verify
 

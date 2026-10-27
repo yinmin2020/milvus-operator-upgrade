@@ -8,7 +8,7 @@
 | --- | --- |
 | [`milvus-operator-upgrade`](./skills/milvus-operator-upgrade/SKILL.md) | 在 **milvus-operator** 部署的 Milvus 上做一键原地升级（只换 Milvus 镜像）与一键回滚；SSH 密钥优先，否则系统密码弹窗；`milvus-backup` 为前置条件，不内置二进制。 |
 
-灵感与分发方式对齐 [mattpocock/skills](https://github.com/mattpocock/skills)：内容放在 GitHub，用官方 `skills` CLI 安装，**不需要把本仓库发布到 npm**。
+安装方式对齐 [mattpocock/skills](https://github.com/mattpocock/skills)：内容放在 GitHub，用官方 `skills` CLI 安装。
 
 ## 安装（推荐）
 
@@ -22,8 +22,6 @@ npx skills@latest add yinmin2020/milvus-operator-upgrade
 npx skills@latest add yinmin2020/milvus-operator-upgrade \
   --skill milvus-operator-upgrade -g
 ```
-
-把上面的 `milvus-operator-upgrade` 换成实际仓库名（例如 `open-milvus-skills` 或新建的仓库名）。
 
 常用 agent 落盘路径（`-g` 时）：
 
@@ -49,19 +47,6 @@ cp -R milvus-operator-upgrade/skills/milvus-operator-upgrade ~/.agents/skills/
 # 或拷到 ~/.codex/skills/、~/.cursor/skills/ 等你实际使用的目录
 ```
 
-## 要不要上 npm？
-
-**不用。**
-
-| 东西 | 作用 |
-| --- | --- |
-| 本仓库（GitHub） | 放 `SKILL.md` + 脚本；用户安装时从这里 clone / 拷贝 |
-| [`skills`](https://www.npmjs.com/package/skills)（vercel-labs） | 通用安装器；用户用 `npx skills add owner/repo` |
-| 本仓库的 `package.json`（若有） | 仅版本号 / changeset，设为 `"private": true`，**不要** `npm publish` |
-
-这和 [mattpocock/skills](https://github.com/mattpocock/skills) 一致：它的 `package.json` 也是 `private: true`，分发靠 GitHub + `npx skills add mattpocock/skills`。
-
-可选：以后若要做 Claude Code / Codex 插件市场，再加 `.claude-plugin/` 清单；那也不是 npm 包。
 
 ## `milvus-operator-upgrade` 速览
 
@@ -83,6 +68,13 @@ cp -R milvus-operator-upgrade/skills/milvus-operator-upgrade ~/.agents/skills/
 4. 选项选目标镜像 → 选项确认风险 → 全自动备份 / 升级 / 校验 / 清理
 5. 始终关闭 SSH 复用连接
 
+
+## 流程图
+
+![Milvus Operator 一键升级流程](./docs/upgrade-flow.svg)
+
+可交互版本（可缩放、开启动画）：[upgrade-flow.html](./docs/upgrade-flow.html)
+
 **前置条件**
 
 - 能 SSH 到 K8s master，且该机有 `kubectl` 管理权限（仅操作用户给出的命名空间）
@@ -101,6 +93,9 @@ skills/
     assets/           # askpass 助手（Mac/Linux/Windows）
     scripts/          # oneshot 升级/回滚、connect、预检等
     references/       # 安装相关备注（升级流程不依赖）
+docs/
+  upgrade-flow.svg    # README 流程图
+  upgrade-flow.html   # 可交互流程图
 README.md
 LICENSE
 .gitignore
