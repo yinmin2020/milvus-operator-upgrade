@@ -1,0 +1,21 @@
+{
+  "name": "milvus-agent-skills",
+  "version": "0.1.0",
+  "description": "Milvus operator upgrade/rollback and related ops skills for coding agents.",
+  "author": {
+    "name": "YIN MIN",
+    "url": "https://github.com/yinmin2020"
+  },
+  "homepage": "https://github.com/yinmin2020/milvus-operator-upgrade",
+  "repository": "https://github.com/yinmin2020/milvus-operator-upgrade",
+  "license": "MIT",
+  "keywords": [
+    "milvus",
+    "kubernetes",
+    "operator",
+    "upgrade"
+  ],
+  "skills": [
+    "./skills/milvus-operator-upgrade"
+  ]
+}

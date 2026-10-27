@@ -1,0 +1,22 @@
+{
+  "name": "yinmin-milvus",
+  "owner": {
+    "name": "YIN MIN",
+    "url": "https://github.com/yinmin2020"
+  },
+  "description": "Milvus agent skills marketplace (operator upgrade and related ops).",
+  "plugins": [
+    {
+      "name": "milvus-agent-skills",
+      "source": "./",
+      "description": "Milvus operator one-shot upgrade/rollback skill.",
+      "category": "devops",
+      "keywords": [
+        "milvus",
+        "kubernetes",
+        "operator",
+        "upgrade"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+# milvus-backup 0.6.1 已知 sha256（仅用于完整性校验；本 skill 不携带也不下载任何二进制）
+# 来源：https://github.com/zilliztech/milvus-backup/releases/tag/v0.6.1 （与官方 milvus-backup_0.6.1_checksums.txt 一致）
+# 下载：https://github.com/zilliztech/milvus-backup/releases/download/v0.6.1/milvus-backup_0.6.1_Linux_<x86_64|arm64>.tar.gz
+# 格式：<sha256>  <名称>；"<包名>/milvus-backup" 为该包解出的二进制
+e7cc1a12614b95ee5e76f87a1ef65774a4b116084242671287e500e004f7cf8a  milvus-backup_0.6.1_Linux_x86_64.tar.gz
+8f3d140596b0db51e7c30f19356ef0c86e3f2ad0ad853983bc3e9c2ca1b23089  milvus-backup_0.6.1_Linux_arm64.tar.gz
+3e5d69d0289b3efdc10b674dc0a1ff1e677d125ea8ad7e0ca07477e610845dd0  milvus-backup_0.6.1_Linux_x86_64/milvus-backup
+e9e6f04d4f320dfacc7751879b0823edeb8c69b990c2b40301ecf9eb1c77df3e  milvus-backup_0.6.1_Linux_arm64/milvus-backup

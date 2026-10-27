@@ -1,0 +1,17 @@
+{
+  "name": "milvus-agent-skills",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Milvus ops skills for coding agents (install via npx skills add, not npm publish)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yinmin2020/milvus-operator-upgrade"
+  },
+  "license": "MIT",
+  "keywords": [
+    "milvus",
+    "agent-skills",
+    "kubernetes",
+    "milvus-operator"
+  ]
+}
