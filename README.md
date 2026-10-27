@@ -71,9 +71,9 @@ cp -R milvus-operator-upgrade/skills/milvus-operator-upgrade ~/.agents/skills/
 
 ## 流程图
 
-![Milvus Operator 一键升级流程](./docs/upgrade-flow.svg)
+![Milvus Operator 一键升级 / 回滚](./docs/upgrade-flow.png)
 
-可交互版本（可缩放、开启动画）：[upgrade-flow.html](./docs/upgrade-flow.html)
+（21:9 · 源文件 [upgrade-flow.svg](./docs/upgrade-flow.svg)）
 
 **前置条件**
 
@@ -94,8 +94,8 @@ skills/
     scripts/          # oneshot 升级/回滚、connect、预检等
     references/       # 安装相关备注（升级流程不依赖）
 docs/
-  upgrade-flow.svg    # README 流程图
-  upgrade-flow.html   # 可交互流程图
+  upgrade-flow.png    # README 流程图（21:9）
+  upgrade-flow.svg    # 矢量源文件
 README.md
 LICENSE
 .gitignore
