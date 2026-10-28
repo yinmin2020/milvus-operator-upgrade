@@ -482,15 +482,16 @@ OBJ=$(python3 "$SCRIPT_DIR/s3tool.py" ls "$S3_URL" "$BUCKET" "backup/$BACKUP_NAM
 log "MinIO $BUCKET/backup/$BACKUP_NAME/: $OBJ"
 [[ $OBJ =~ OBJECTS=([0-9]+)\ BYTES=([0-9]+) ]] && [ "${BASH_REMATCH[1]}" -gt 0 ] || die 6 "MinIO 中 backup/$BACKUP_NAME/ 下没有对象"
 BK_BYTES=${BASH_REMATCH[2]}
-# RBAC 元数据校验：backup_meta.json 的 rbac_meta（只取数量，不输出内容；其中含密码哈希，导出副本与 MinIO 备份都要妥善保管）
+# RBAC 元数据校验：备份 meta/full_meta.json（0.6.x；旧版本 backup_meta.json）的 rbac_meta（只取数量，不输出内容；其中含密码哈希，导出副本与 MinIO 备份都要妥善保管）
 RBAC_META=$(python3 "$SCRIPT_DIR/s3tool.py" rbacmeta "$S3_URL" "$BUCKET" "backup/$BACKUP_NAME/" "$CRED") || die 6 "读取备份的 RBAC 元数据失败: $RBAC_META"
 log "$RBAC_META"
 if [ "$AUTH_ON" = true ]; then
   rb_n(){ echo "$RBAC_META" | sed -n "s/.*$1=\([0-9]*\).*/\1/p"; }
   [[ $RBAC_META == *present=yes* ]] || { gate backup_rbac "FAIL (备份没有 RBAC 元数据)"; die 6 "开启了鉴权但备份里没有 RBAC 元数据（用户/角色/授权未被备份）。检查 MILVUS_TOKEN 是否为 root/admin、milvus-backup 版本是否为 0.6.1，见 $RUN_DIR/backup_create.out；未升级"; }
-  pre_u=$(python3 -c "import json,sys; s=json.load(open(sys.argv[1])); print(len(s['users']), len(s['roles']))" "$RUN_DIR/rbac_pre.json")
-  set -- $pre_u   # 备份里的用户/角色数不得少于备份前快照（服务端可能多带内置项）
-  { [ "$(rb_n users)" -ge "$1" ] && [ "$(rb_n roles)" -ge "$2" ]; } || { gate backup_rbac "FAIL (备份 users/roles=$(rb_n users)/$(rb_n roles) 与快照 $pre_u 不符)"; die 6 "备份中的 RBAC 用户/角色数与备份前快照不一致（$RBAC_META，快照 users roles=$pre_u）；未升级"; }
+  # milvus-backup 的 rbac_meta 不含内置用户 root 与内置角色 admin/public，比较前从快照里去掉它们
+  pre_u=$(python3 -c "import json,sys; s=json.load(open(sys.argv[1])); print(len([u for u in s['users'] if u != 'root']), len([r for r in s['roles'] if r not in ('admin', 'public')]))" "$RUN_DIR/rbac_pre.json")
+  set -- $pre_u   # 备份里的自定义用户/角色数不得少于备份前快照
+  { [ "$(rb_n users)" -ge "$1" ] && [ "$(rb_n roles)" -ge "$2" ]; } || { gate backup_rbac "FAIL (备份 users/roles=$(rb_n users)/$(rb_n roles) 与快照自定义用户/角色 $pre_u 不符)"; die 6 "备份中的 RBAC 用户/角色数与备份前快照不一致（$RBAC_META，快照自定义 users roles=$pre_u）；未升级"; }
   gate backup_rbac "PASS ($RBAC_META)"
   RBAC_BK_RES="备份带 --rbac；$RBAC_META"
 else

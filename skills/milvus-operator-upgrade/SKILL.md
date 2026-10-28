@@ -174,7 +174,7 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 - **验证**：升级前（及恢复前）用 REST 快照用户、角色、用户-角色绑定、授权（`probe.py rbac-snapshot`，600 权限，只含名称和授权条目，不含密码）；升级后/恢复后再比较（`rbac-compare`）。不一致 = 关卡 FAIL，退出码 14（升级：`ONESHOT PARTIAL`；恢复：部分恢复），**绝不报告“完整恢复/成功”**。
 - **可选应用用户检查**：`--rbac-test [--rbac-test-collection <集合>] [--rbac-test-deny list_users,create_collection]`，另需环境变量 `MILVUS_TEST_TOKEN=appuser:password`（或 `MILVUS_TEST_TOKEN_FILE`）。脚本用该自定义应用用户在升级后/恢复后做一次允许的操作（对集合 query）和被禁止的操作（默认 `list_users`，可选 `create_collection`），允许成功且禁止被拒才 PASS；用户权限过大（禁止的操作成功）也算 FAIL。
 - **旧备份没有 RBAC 元数据**（在本修复之前做的备份）：恢复只能恢复数据。脚本在**删除任何东西之前**检查，开启鉴权且备份不含 RBAC 时退出 5 并打印 `RBAC_DECISION_NEEDED`；预检也会给 `backup_rbac` WARN 和同样的标记。此时必须用**选项框**问用户（见恢复流程 D）。
-- 升级脚本在备份后检查 `backup_meta.json` 里确有 `rbac_meta`（开启鉴权时，读 MinIO 中的备份，与 `--no-export` 无关），没有则退出 6，不会改镜像。
+- 升级脚本在备份后检查备份元数据里确有 `rbac_meta`（milvus-backup 0.6.x 写在 `meta/full_meta.json`，旧版本在 `backup_meta.json`）（开启鉴权时，读 MinIO 中的备份，与 `--no-export` 无关），没有则退出 6，不会改镜像。
 
 ## 前置条件：milvus-backup 0.6.1
 
@@ -219,7 +219,7 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 7b. 导出：检查磁盘（可用 ≥ 备份大小×1.2 + 1GiB），`s3tool.py pull` 到导出目录并写 MANIFEST（size/sha256/key），对象数必须一致；写 `backup.meta`（NS、CR、备份名、源/目标镜像、导出目录、探针集合与探针结果路径），供恢复脚本自动发现。
 8. 升级：按需固定 serviceType，nodePort 有漂移时按快照 patch 回去；用一次 merge patch 改镜像并设置 securityContext。之后每 10 秒检查一次，每 30 秒打印一次进度，直到 Healthy、`MilvusUpdated=True`、currentImage 等于目标镜像、所有 Pod 都换成新镜像并 Ready。CrashLoop 且重启次数 ≥ 3 时打印 `logs --previous` 并退出 7；patch 300 秒后仍处于 ImagePullBackOff 或整体超时（默认 1200 秒）也退出 7。
 9. 校验：运行 `verify.sh`，加 `milvus.io/reconcile` 注解，等 40 秒后再运行一次 `verify.sh`。
-10. 升级后探针：行数必须一致，top-k id 必须一致。
+10. 升级后探针：行数必须一致；top-k id 一致即通过。HNSW 等近似索引重建后 top-k 尾部可能变化，此时改为近似校验：探针行向量逐值一致、top-1 一致、重叠 >= ceil(0.6·k)。
 10b. 鉴权实例：`rbac-compare`（与升级前快照逐项比较）和可选 `rbac-authtest`；不一致 → 退出 14。
 11. 报告：生成 `report.md`，打印 `ONESHOT OK`。
 最后由 trap 清理（成功或失败都会执行）：结束 port-forward（按 PID，再按本次 SA kubeconfig 路径兜底 pkill，并在日志打印残留数，应为 0），删除拉取检查 Pod，删除 SA/Role/RoleBinding（token 随 SA 一起失效），删除临时目录（kubeconfig、MinIO 凭据、milvus-backup 配置和解压出的二进制）。最后打印 `ONESHOT_RESULT`。

@@ -21,6 +21,7 @@ ap.add_argument('--backup-bin', default=os.environ.get('MILVUS_BACKUP_BIN', ''))
 ap.add_argument('--workdir', default='/root/milvus-upgrade')
 ap.add_argument('--operator-ns', default='')
 ap.add_argument('--rbac-test', action='store_true')
+ap.add_argument('--backup', default='', help='restore：检查指定备份（默认最近一个）')
 a = ap.parse_args()
 KC = os.environ.get('ADMIN_KUBECONFIG') or os.environ.get('KUBECONFIG') or os.path.expanduser('~/.kube/config')
 ITEMS = []; FACTS = []
@@ -391,10 +392,15 @@ else:
         ed = m.get('EXPORT_DIR', '')
         man = os.path.join(ed, 'MANIFEST') if ed else ''
         nobj = sum(1 for _ in open(man)) if man and os.path.isfile(man) else 0
-        # 备份是否含 RBAC 元数据（读本地导出的 backup_meta.json，只统计数量，不输出内容）
+        # 备份是否含 RBAC 元数据（读本地导出的 full_meta.json / backup_meta.json，只统计数量，不输出内容）
         rb = 'unknown'
-        bm = os.path.join(ed, 'backup', m.get('BACKUP_NAME', ''), 'meta', 'backup_meta.json') if ed else ''
-        if bm and os.path.isfile(bm):
+        # milvus-backup 0.6.x 的 rbac_meta 只在 full_meta.json 里；旧版本在 backup_meta.json
+        bm = ''
+        for f_ in ('full_meta.json', 'backup_meta.json'):
+            p_ = os.path.join(ed, 'backup', m.get('BACKUP_NAME', ''), 'meta', f_) if ed else ''
+            if p_ and os.path.isfile(p_):
+                bm = p_; break
+        if bm:
             try:
                 r_ = json.load(open(bm)).get('rbac_meta') or {}
                 rb = 'yes' if any(r_.get(x_) for x_ in ('users', 'roles', 'grants', 'privilege_groups')) else 'no'
@@ -405,22 +411,28 @@ else:
         print('BACKUP index=%d name=%s source_image=%s target_image=%s export=%s objects=%d probe=%s rbac=%s meta=%s' % (
             len(metas), m.get('BACKUP_NAME', ''), m.get('SOURCE_IMAGE', ''), m.get('TARGET_IMAGE', ''), ed or '-', nobj, m.get('PROBE_COLLECTION', '') or '-', rb, f))
     fact('backups', len(metas))
-    if metas:
-        b = metas[0]
+    sel = metas[0] if metas else None
+    if metas and a.backup:
+        sel = next((m for m in metas if m.get('BACKUP_NAME') == a.backup), None)
+        if sel is None:
+            item('backup', 'WARN', '指定的备份 %s 在 %s 下没有本 CR 的 backup.meta 记录；正式运行会从 MinIO 取该备份，并在删除任何东西之前检查 RBAC 元数据' % (a.backup, runs))
+    which = '指定备份' if a.backup else '最近备份'
+    if sel:
+        b = sel
         print('SUGGEST restore_image=%s' % b.get('SOURCE_IMAGE', ''))
         print('SUGGEST backup=%s' % b.get('BACKUP_NAME', ''))
         ok = bool(b.get('EXPORT_DIR')) and os.path.isfile(os.path.join(b['EXPORT_DIR'], 'MANIFEST'))
-        item('backup', 'PASS' if ok else 'WARN', '最近备份 %s（升级前镜像 %s）%s' % (b.get('BACKUP_NAME'), b.get('SOURCE_IMAGE'),
+        item('backup', 'PASS' if ok else 'WARN', '%s %s（升级前镜像 %s）%s' % (which, b.get('BACKUP_NAME'), b.get('SOURCE_IMAGE'),
              '，master 本地导出副本可用' if ok else '，无本地导出副本：恢复时会先从当前 MinIO 导出，MinIO 数据已损坏则无法恢复'))
-    else:
+    elif not metas:
         item('backup', 'WARN', '%s 下没有本 CR 的升级备份记录(backup.meta)；恢复时将使用当前 MinIO 中最新的 pre_upgrade_* 备份，恢复镜像需人工指定' % runs)
-    if metas and auth_on and metas[0]['_rbac'] == 'unknown':
-        item('backup_rbac', 'WARN', '实例开启了鉴权，但无法确认最近备份 %s 是否含 RBAC（没有本地导出副本）；正式运行会在删除任何东西之前检查，备份不含 RBAC 时退出 5 并要求选择' % metas[0].get('BACKUP_NAME', ''))
-    elif metas and auth_on and metas[0]['_rbac'] != 'yes':
-        print('RBAC_DECISION_NEEDED backup=%s rbac=%s' % (metas[0].get('BACKUP_NAME', ''), metas[0]['_rbac']))
-        item('backup_rbac', 'WARN', '实例开启了鉴权，但最近备份 %s 不含 RBAC 元数据（rbac=%s）：恢复只能恢复数据，用户/角色/授权丢失，结果为部分恢复（退出码 14）。需用户选择“仅恢复数据（--accept-rbac-loss）/取消”，不加 --accept-rbac-loss 时正式运行会在删除任何东西之前退出 5' % (metas[0].get('BACKUP_NAME', ''), metas[0]['_rbac']))
-    elif metas and metas[0]['_rbac'] == 'yes':
-        item('backup_rbac', 'PASS', '最近备份 %s 含 RBAC 元数据' % metas[0].get('BACKUP_NAME', ''))
+    if sel and auth_on and sel['_rbac'] == 'unknown':
+        item('backup_rbac', 'WARN', '实例开启了鉴权，但无法确认%s %s 是否含 RBAC（没有本地导出副本）；正式运行会在删除任何东西之前检查，备份不含 RBAC 时退出 5 并要求选择' % (which, sel.get('BACKUP_NAME', '')))
+    elif sel and auth_on and sel['_rbac'] != 'yes':
+        print('RBAC_DECISION_NEEDED backup=%s rbac=%s' % (sel.get('BACKUP_NAME', ''), sel['_rbac']))
+        item('backup_rbac', 'WARN', '实例开启了鉴权，但%s %s 不含 RBAC 元数据（rbac=%s）：恢复只能恢复数据，用户/角色/授权丢失，结果为部分恢复（退出码 14）。需用户选择“仅恢复数据（--accept-rbac-loss）/取消”，不加 --accept-rbac-loss 时正式运行会在删除任何东西之前退出 5' % (which, sel.get('BACKUP_NAME', ''), sel['_rbac']))
+    elif sel and sel['_rbac'] == 'yes':
+        item('backup_rbac', 'PASS', '%s %s 含 RBAC 元数据' % (which, sel.get('BACKUP_NAME', '')))
     item('restore_impact', 'INFO', '恢复会删除 %s/%s 当前实例及其 etcd/MinIO/PVC 数据，备份点之后的数据全部丢失' % (a.ns, name))
 
 fails = [n for n, s_, _ in ITEMS if s_ == 'FAIL']

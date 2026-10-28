@@ -22,6 +22,7 @@ try:
 except ImportError:  # pragma: no cover
     sys.exit(3)
 DEFAULT_ROOT = 'root:Milvus'
+BUILTIN_GROUPS = {'%s%s' % (a, b) for a in ('Cluster', 'Database', 'Collection') for b in ('ReadOnly', 'ReadWrite', 'Admin')}
 
 
 class ApiError(RuntimeError):
@@ -120,8 +121,10 @@ def rbac_snapshot(ep, token=None):
     """用户 / 角色 / 绑定 / 授权 / 权限组。REST 不返回密码，快照里没有密码或哈希。"""
     users = {}
     for u in call(ep, '/v2/vectordb/users/list', {}, token=token) or []:
-        d = call(ep, '/v2/vectordb/users/describe', {'userName': u}, token=token) or {}
-        users[u] = sorted(d.get('roles') or [])
+        d = call(ep, '/v2/vectordb/users/describe', {'userName': u}, token=token) or []
+        # 2.6/3.0 RESTful v2 的 users/describe 返回角色名列表（data: ["role", ...]）；兼容返回 {"roles": [...]} 的写法
+        rl = d.get('roles') if isinstance(d, dict) else d
+        users[u] = sorted(x if isinstance(x, str) else (x.get('roleName') or x.get('name') or '') for x in (rl or []))
     roles = sorted(call(ep, '/v2/vectordb/roles/list', {}, token=token) or [])
     grants = set()
     for r in roles:
@@ -129,10 +132,22 @@ def rbac_snapshot(ep, token=None):
             grants.add((r, g.get('objectType', ''), g.get('objectName', ''), g.get('privilege', ''), g.get('dbName', '')))
     groups = {}
     try:
-        for g in call(ep, '/v2/vectordb/privilege_groups/list', {}, token=token) or []:
-            groups[g.get('privilegeGroupName', '')] = sorted(g.get('privileges') or [])
+        pg = call(ep, '/v2/vectordb/privilege_groups/list', {}, token=token) or []
     except ApiError:
-        pass   # 旧版本没有权限组接口
+        pg = []   # 旧版本没有权限组接口
+    # 2.6/3.0 返回 data: {"privilegeGroups": [{"privilegeGroupName": .., "privileges": "A,B,C"}]}；privileges 也可能是列表
+    if isinstance(pg, dict):
+        pg = pg.get('privilegeGroups') or []
+    for g in pg:
+        if not isinstance(g, dict):
+            continue
+        name = g.get('privilegeGroupName') or g.get('groupName') or ''
+        if name in BUILTIN_GROUPS:
+            continue   # 内置权限组由 Milvus 版本定义（升级后可能增加权限），不属于用户 RBAC，不备份也不比较
+        pv = g.get('privileges') or []
+        if isinstance(pv, str):
+            pv = [x.strip() for x in pv.split(',') if x.strip()]
+        groups[name] = sorted(x if isinstance(x, str) else (x.get('name') or '') for x in pv)
     return {'users': users, 'roles': roles, 'grants': sorted(list(x) for x in grants), 'privilege_groups': groups}
 
 
@@ -362,10 +377,35 @@ def main():
             time.sleep(10)
     json.dump(out, open(a.out, 'w'), ensure_ascii=False)
     print('PROBE POST: ' + json.dumps(out, ensure_ascii=False))
-    ok = out['count'] == pre['count'] and out.get('topk') == pre.get('topk')
-    print('PROBE %s: count %s -> %s, top%d %s -> %s' % ('MATCH' if ok else 'MISMATCH', pre['count'], out['count'],
-                                                     a.topk, pre.get('topk'), out.get('topk')))
+    ok, note = verdict(a.endpoint, a.collection, pre, out, state)
+    print('PROBE %s: count %s -> %s, top%d %s -> %s%s' % ('MATCH' if ok else 'MISMATCH', pre['count'], out['count'],
+                                                       a.topk, pre.get('topk'), out.get('topk'), note))
     return 0 if ok else 9
+
+
+def verdict(ep, c, pre, out, state):
+    """行数必须一致。top-k 完全一致 = MATCH。HNSW 等 ANN 索引是近似检索：恢复时 --rebuild_index 重建的图与原图不同，
+    top-k 的成员/顺序可能变化（实测 5000 行 HNSW：[0,4693,1937,1411,3887] -> [0,4693,1937,3887,560]，两者都不是精确结果）。
+    因此 top-k 不完全一致时改用确定性校验：探针行（query_pk）的向量与 pre 记录逐值一致、top-1 一致、top-k 重叠 >= 60%。"""
+    if out['count'] != pre['count']:
+        return False, ''
+    a, b = pre.get('topk'), out.get('topk')
+    if a == b:
+        return True, ''
+    if not a or not b or not state or 'vector' not in state:
+        return False, ''
+    k = len(a); ov = len(set(a) & set(b)); need = -(-k * 3 // 5)
+    try:
+        pk = out.get('pk') or pre.get('pk'); vf = out.get('vector_field') or pre.get('vector_field')
+        flt = '%s == %s' % (pk, json.dumps(state['pk']))
+        row = call(ep, '/v2/vectordb/entities/query', {'collectionName': c, 'filter': flt, 'limit': 1, 'outputFields': [pk, vf]})
+        same_vec = bool(row) and len(row[0][vf]) == len(state['vector']) and \
+            all(abs(float(x) - float(y)) <= 1e-6 * max(1.0, abs(float(y))) for x, y in zip(row[0][vf], state['vector']))
+    except Exception as e:
+        return False, '（ANN 近似校验出错: %s）' % e
+    ok = same_vec and a[0] == b[0] and ov >= need
+    return ok, '（top-k 不完全一致；ANN 近似校验：探针行 %s=%s 的向量%s，top-1 %s，重叠 %d/%d，要求 >= %d）' % (
+        pk, state['pk'], '逐值一致' if same_vec else '不一致', '一致' if a[0] == b[0] else '不一致', ov, k, need)
 
 
 if __name__ == '__main__':

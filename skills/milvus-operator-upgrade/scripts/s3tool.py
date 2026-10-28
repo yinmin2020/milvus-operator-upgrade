@@ -5,7 +5,7 @@
   s3tool.py pull <endpoint> <bucket> <prefix> <cred> <local_dir>    把 prefix 下所有对象下载到 local_dir/<key>，写 local_dir/MANIFEST
   s3tool.py push <endpoint> <bucket> <prefix> <cred> <local_dir>    按 local_dir/MANIFEST 把对象上传回 bucket（key 不变；桶不存在则创建）
   s3tool.py verify - - <prefix> - <local_dir>                       只校验本地副本（MANIFEST 中 prefix 下对象的大小与 sha256）
-  s3tool.py rbacmeta <endpoint|-> <bucket|-> <prefix> <cred|-> [local_dir]   读备份 meta/backup_meta.json 的 rbac_meta，只打印数量：RBAC_META present=yes|no users= roles= grants= groups=（无 local_dir 时读 MinIO；不输出密码哈希）
+  s3tool.py rbacmeta <endpoint|-> <bucket|-> <prefix> <cred|-> [local_dir]   读备份 meta/full_meta.json（回退 backup_meta.json）的 rbac_meta，只打印数量：RBAC_META present=yes|no users= roles= grants= groups=（无 local_dir 时读 MinIO；不输出密码哈希）
 MANIFEST 每行: <size> <sha256> <key>。出错退出 3。"""
 import datetime, hashlib, hmac, json, os, re, sys
 from urllib.parse import quote, urlparse
@@ -97,14 +97,24 @@ def main():
     cmd, ep, bucket, prefix, credf = sys.argv[1:6]
     if cmd == 'rbacmeta':
         # rbacmeta <endpoint|-> <bucket|-> <backup/NAME/> <cred|-> [本地导出目录]：有本地目录时读本地 <dir>/<prefix>meta/backup_meta.json，否则读 MinIO
-        key = prefix.rstrip('/') + '/meta/backup_meta.json'
+        # milvus-backup 0.6.x 只把 rbac_meta 写进 meta/full_meta.json（backup_meta.json 只有 id/name/size 等标量）；
+        # 旧版本写在 backup_meta.json。依次尝试，取第一个存在的文件。
+        keys = [prefix.rstrip('/') + '/meta/' + f for f in ('full_meta.json', 'backup_meta.json')]
         if len(sys.argv) > 6:
-            path = os.path.join(os.path.abspath(sys.argv[6]), key)
-            if not os.path.isfile(path):
-                print('RBAC_META present=unknown (没有 %s)' % key); return 3
-            print(rbac_summary(open(path, 'rb').read())); return 0
-        with S3(ep, bucket, credf).req('GET', key) as r:
-            print(rbac_summary(r.read())); return 0
+            for key in keys:
+                path = os.path.join(os.path.abspath(sys.argv[6]), key)
+                if os.path.isfile(path):
+                    print(rbac_summary(open(path, 'rb').read())); return 0
+            print('RBAC_META present=unknown (没有 %s)' % ' / '.join(keys)); return 3
+        s3 = S3(ep, bucket, credf)
+        last = None
+        for key in keys:
+            try:
+                with s3.req('GET', key) as r:
+                    print(rbac_summary(r.read())); return 0
+            except Exception as e:   # full_meta.json 不存在（旧版本备份）时回退 backup_meta.json
+                last = e
+        raise last
     if cmd == 'verify':
         items = read_manifest(os.path.abspath(sys.argv[6]), prefix)
         print('VERIFIED OBJECTS=%d BYTES=%d' % (len(items), sum(s for _, s in items))); return 0

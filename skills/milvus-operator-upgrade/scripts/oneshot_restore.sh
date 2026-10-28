@@ -46,6 +46,7 @@ if [ $CHECK_ONLY = 1 ]; then
   [[ ${pos[0]} =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || { echo "NS 不合法: ${pos[0]}"; echo "CHECK_RESULT rc=2"; exit 2; }
   ca=(restore "${pos[0]}" --workdir "$WORKBASE"); [ -z "$NAME" ] || ca+=(--name "$NAME"); [ -z "$BACKUP_BIN" ] || ca+=(--backup-bin "$BACKUP_BIN")
   [ $RBAC_TEST = 0 ] || ca+=(--rbac-test)
+  [ -z "$BACKUP_NAME" ] || ca+=(--backup "$BACKUP_NAME")
   ADMIN_KUBECONFIG=$ADMIN_KC exec python3 "$SCRIPT_DIR/check.py" "${ca[@]}"
 fi
 [ ${#pos[@]} -eq 2 ] || { usage; exit 2; }
