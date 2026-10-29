@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # milvus-operator 一键原地升级（在 master 上以 root 运行）
-# 用法: oneshot_upgrade.sh <NS> --check-only [--name CR] [--target-tag v3.0.3] [TARGET_IMAGE]   # 只读预检，不建任何对象
+# 用法: oneshot_upgrade.sh <NS> --check-only [--name CR] [--target-tag TAG] [TARGET_IMAGE]   # 只读预检，不建任何对象；省略 tag 则列出合法终点
 #       oneshot_upgrade.sh <NS> <TARGET_IMAGE> [--name CR] [--backup-bin PATH] [--probe-collection C] [--export-dir DIR]
 #                         [--no-export] [--operator-ns ONS] [--upgrade-timeout 1200] [--token-ttl 3h] [--workdir DIR] [--yes]
 #                         [--rbac-test [--rbac-test-collection C] [--rbac-test-deny list_users,create_collection]]
@@ -16,7 +16,7 @@ usage(){ sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
 # ---------- 参数 ----------
 NS=""; TARGET_IMAGE=""; NAME=""; BACKUP_BIN="${MILVUS_BACKUP_BIN:-}"; PROBE=""; ONS=""; YES=0; EXPORT_DIR=""; NO_EXPORT=0
 RBAC_TEST=0; RBAC_TEST_COLL=""; RBAC_TEST_DENY=list_users
-CHECK_ONLY=0; TARGET_TAG=v3.0.3; UPGRADE_TIMEOUT=1200; PULL_TIMEOUT=900; TOKEN_TTL=3h; WORKBASE=/root/milvus-upgrade
+CHECK_ONLY=0; TARGET_TAG=; UPGRADE_TIMEOUT=1200; PULL_TIMEOUT=900; TOKEN_TTL=3h; WORKBASE=/root/milvus-upgrade
 ADMIN_KC=${ADMIN_KUBECONFIG:-${KUBECONFIG:-$HOME/.kube/config}}
 pos=()
 while [ $# -gt 0 ]; do
@@ -46,7 +46,8 @@ if [ $CHECK_ONLY = 1 ]; then
   # 只读预检：不创建目录/文件/集群对象，直接交给 check.py（输出 CHECK*/SUGGEST 行 + 表格 + CHECK_RESULT rc=N）
   [ ${#pos[@]} -ge 1 ] && [ ${#pos[@]} -le 2 ] || { usage; exit 2; }
   [[ ${pos[0]} =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] || { echo "NS 不合法: ${pos[0]}"; echo "CHECK_RESULT rc=2"; exit 2; }
-  ca=(upgrade "${pos[0]}" --target-tag "$TARGET_TAG" --workdir "$WORKBASE")
+  ca=(upgrade "${pos[0]}" --workdir "$WORKBASE")
+  [ -z "$TARGET_TAG" ] || ca+=(--target-tag "$TARGET_TAG")
   [ -z "$NAME" ] || ca+=(--name "$NAME"); [ -z "$BACKUP_BIN" ] || ca+=(--backup-bin "$BACKUP_BIN")
   [ -z "$ONS" ] || ca+=(--operator-ns "$ONS"); [ ${#pos[@]} -lt 2 ] || ca+=(--target-image "${pos[1]}")
   [ $RBAC_TEST = 0 ] || ca+=(--rbac-test)
@@ -114,11 +115,13 @@ trap '_erc=$?; _eln=$LINENO; echo "[$(date "+%F %T")] ERROR: 第 $_eln 行命令
 # ---------- 风险提示（与 SKILL.md 一致） ----------
 cat <<NOTICE
 ================ 风险提示 ================
-将对命名空间 [$NS] 中的 Milvus 原地升级到 [$TARGET_IMAGE]，全程无人值守，任一关卡失败即停止：
-1. 修改 Milvus CR：spec.components.image=目标镜像（只换 Milvus 镜像，etcd/MinIO/MQ 及其镜像不动），
-   并设置 spec.components.securityContext={runAsUser:0, runAsNonRoot:false}（容器以 root 运行）。
-   【与官方文档的差异】官方只 patch spec.components.image；这里额外改为 root，因为 2.6 写入的 rocksmq/缓存文件属主是 root，
+将对命名空间 [$NS] 中的 Milvus 按版本路径原地升级到 [$TARGET_IMAGE]（可能多跳；两端对等：可停在 2.6.x 或升到 GA 3.0.y），全程无人值守，任一关卡失败即停止：
+1. 按官方文档展开 hops（见 references/upgrade-paths.md）：可能先升 operator≥1.3.7（由你在 operator 命名空间完成，本 skill 不跨 NS 改 operator）、
+   Cluster 启用 mixCoord、经 ≥2.5.16 / 2.6.x 桥接，再改 Milvus 镜像；etcd/MinIO/MQ 及其镜像不动。
+   每跳设置 securityContext={runAsUser:0, runAsNonRoot:false}（容器以 root 运行）。
+   【与官方文档的差异】官方 2.6→3.0 Standalone 只 patch image；这里额外改为 root，因为 2.6 写入的 rocksmq/缓存文件属主是 root，
    3.0 镜像默认非 root 用户启动会 Permission denied/CrashLoop。若安全策略不允许 root 容器，请取消。
+   Cluster→3.0：倾向完整 CR apply（显式 indexNode.replicas=0），保留现有拓扑；组件与官方模板差异大时请先非生产验证。
    Service 为 NodePort/LoadBalancer 时把 CR 的 serviceType 固定为同类型（nodePort 漂移则改回快照值）。
 2. 在 [$NS] 临时创建 SA/Role/RoleBinding "$SA" 和短期 token，结束（含失败）自动删除；之后所有操作都用该 SA 身份执行。
 3. 用 milvus-backup 做全量备份 pre_upgrade_<时间戳>，写入该 Milvus 的 MinIO 桶（backup/ 前缀），不自动删除；
@@ -230,18 +233,56 @@ fi
 [ "$STATUS" = Healthy ] || die 5 "CR status=$STATUS（必须 Healthy）"
 [ "$UPDATED" = True ] || die 5 "MilvusUpdated=$UPDATED（必须 True）"
 [ "${PAUSED:-false}" != true ] || die 5 "CR paused=true，不能在暂停状态改镜像"
-ver(){ echo "$1" | sed -n 's/.*:v\{0,1\}\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p'; }
-read -r cM cm cp <<<"$(ver "$CUR_IMAGE")" || true; read -r tM tm tp <<<"$(ver "$TARGET_IMAGE")" || true
-if [ -n "${cM:-}" ] && [ -n "${tM:-}" ]; then
-  cur_n=$((cM*1000000+cm*1000+cp)); tgt_n=$((tM*1000000+tm*1000+tp))
-  [ $ALREADY = 1 ] || [ $tgt_n -gt $cur_n ] || die 5 "目标版本 $tM.$tm.$tp 不高于当前 $cM.$cm.$cp（不支持降级/同版本）"
-  ! [[ $CUR_IMAGE =~ :v?2\.6\.0-rc ]] || die 5 "当前为 2.6.0-rc*，官方文档声明不兼容、不支持直接升级"
-  [ $ALREADY = 1 ] || [ $cur_n -ge 2005016 ] || die 5 "官方文档要求当前版本 ≥ 2.5.16 才能升级到 2.6/3.x（当前 $cM.$cm.$cp），请先升级到 2.5.16+"
-  if [ "$tM" -ge 3 ] && [ $cur_n -lt 2006000 ]; then die 5 "升级到 3.x 需先到 2.6.x（当前 $cM.$cm.$cp；本 skill 只验证过 2.6.25 -> 3.0.3）"; fi
-  log "版本路径 $cM.$cm.$cp -> $tM.$tm.$tp（已验证路径：2.6.25 -> 3.0.3 @ operator 1.3.12）"
-else
-  log "WARN: 无法从 tag 解析版本号，跳过版本路径检查"
+# 版本路径：交由 upgrade_paths.py（官方文档；不强制经 2.6.24）
+HAS_MIX=0
+MIX_JSON=$(ksa -n "$NS" get milvus "$NAME" -o jsonpath='{.spec.components.mixCoord}' 2>/dev/null || true)
+[ -n "$MIX_JSON" ] && [ "$MIX_JSON" != "null" ] && HAS_MIX=1
+STATUS_IMG=$(cr '{.status.currentImage}')
+POD_IMGS=$(ksa -n "$NS" get pods -l "app.kubernetes.io/instance=$NAME,app.kubernetes.io/name=milvus" -o jsonpath='{range .items[*].spec.containers[*]}{.image}{","}{end}' 2>/dev/null || true)
+SRC_LINE=$(python3 "$SCRIPT_DIR/upgrade_paths.py" discover --cr-image "$CUR_IMAGE" --status-image "$STATUS_IMG" --pod-images "$POD_IMGS" | awk '/^SOURCE /{print; exit}')
+log "源版本发现: ${SRC_LINE:-none}"
+SOURCE_TAG=$(echo "$SRC_LINE" | sed -n 's/.* version=\([^ ]*\).*/\1/p')
+[ -n "$SOURCE_TAG" ] || SOURCE_TAG=$(python3 "$SCRIPT_DIR/upgrade_paths.py" parse "$CUR_IMAGE" | awk '/^PARSE ok=1/{print $0}' | sed -n 's/.* tag=\([^ ]*\).*/\1/p')
+TARGET_TAG_RESOLVED=$(python3 "$SCRIPT_DIR/upgrade_paths.py" parse "$TARGET_IMAGE" | awk '/^PARSE ok=1/{for(i=1;i<=NF;i++) if($i~/^tag=/){sub(/^tag=/,"",$i); print $i}}')
+PATH_OUT=$(mktemp)
+set +e
+python3 "$SCRIPT_DIR/upgrade_paths.py" plan --source "${SOURCE_TAG:-$CUR_IMAGE}" --target "${TARGET_TAG_RESOLVED:-$TARGET_IMAGE}" \
+  --mode "$MODE" --has-mixcoord "$HAS_MIX" --operator "${OPVER:-$OP_IMAGE}" >"$PATH_OUT" 2>&1
+prc=$?
+set -e
+cat "$PATH_OUT" | while IFS= read -r ln; do log "path: $ln"; done
+if grep -q '^PATH_BLOCK ' "$PATH_OUT"; then
+  die 5 "$(grep '^PATH_BLOCK ' "$PATH_OUT" | head -1 | sed 's/^PATH_BLOCK //')"
 fi
+[ $prc = 0 ] || [ $ALREADY = 1 ] || die 5 "版本路径规划失败（rc=$prc），见上方 path: 日志"
+PATH_PLAN_LINE=$(grep '^PATH_PLAN ' "$PATH_OUT" | tail -1 || true)
+HOP_TAGS=$(echo "$PATH_PLAN_LINE" | sed -n 's/.* hops=\([^ ]*\).*/\1/p')
+[ "$HOP_TAGS" = "BLOCKED" ] && die 5 "版本路径被阻止"
+# 软警告（如 2.6.x < 2.6.20）不阻断
+grep '^PATH_WARN ' "$PATH_OUT" >/dev/null && log "注意: 存在 PATH_WARN（不阻断，见 references/upgrade-paths.md）"
+log "版本路径计划: ${PATH_PLAN_LINE:-?}（官方文档；已验证参考 2.6.20→3.0.3；不强制 2.6.24）"
+# 保存 hop 明细供升级阶段使用
+cp "$PATH_OUT" "$RUN_DIR/path_plan.txt"
+rm -f "$PATH_OUT"
+# 解析 hops → 镜像列表（拉取检查 + 多跳升级）
+REPO_BASE=$(python3 -c "import re,sys; s=sys.argv[1]; print(re.sub(r'(@sha256:[0-9a-f]+|:[A-Za-z0-9_.+-]+)$','',s) or 'milvusdb/milvus')" "$TARGET_IMAGE")
+HOP_IMAGES=()
+HOP_META=()  # tag|enable_mixcoord|require_op|apply_mode
+while IFS= read -r hline; do
+  tag=$(echo "$hline" | sed -n 's/.* tag=\([^ ]*\).*/\1/p')
+  em=$(echo "$hline" | sed -n 's/.* enable_mixcoord=\([01]\).*/\1/p')
+  ro=$(echo "$hline" | sed -n 's/.* require_operator_ge=\([^ ]*\).*/\1/p')
+  am=$(echo "$hline" | sed -n 's/.* apply_mode=\([^ ]*\).*/\1/p')
+  [ -n "$tag" ] || continue
+  HOP_IMAGES+=("${REPO_BASE}:${tag}")
+  HOP_META+=("${tag}|${em:-0}|${ro:--}|${am:-merge}")
+done < <(grep '^HOP ' "$RUN_DIR/path_plan.txt" || true)
+if [ ${#HOP_IMAGES[@]} -eq 0 ]; then
+  _htag=$(python3 "$SCRIPT_DIR/upgrade_paths.py" parse "$TARGET_IMAGE" | awk '/^PARSE ok=1/{for(i=1;i<=NF;i++) if($i~/^tag=/){sub(/^tag=/,"",$i); print $i}}')
+  HOP_IMAGES=("$TARGET_IMAGE")
+  HOP_META=("${_htag:-vunknown}|0|-|merge")
+fi
+log "待执行 hops (${#HOP_IMAGES[@]}): ${HOP_IMAGES[*]}"
 bash "$SCRIPT_DIR/snapshot_svc.sh" "$NS" "$NAME" | tee "$RUN_DIR/svc_snapshot.txt"
 [ -s "$RUN_DIR/svc_snapshot.txt" ] || die 5 "找不到 $NAME 的 Service"
 SVC="$NAME-milvus"
@@ -263,7 +304,11 @@ mapfile -t NODES < <(ksa -n "$NS" get pods -l "$MSEL" -o jsonpath='{range .items
 [ ${#NODES[@]} -gt 0 ] || die 5 "找不到 Milvus Pod 所在节点"
 [ ${#NODES[@]} -le 10 ] || NODES=("${NODES[@]:0:10}")
 ips=""; for s in $PULL_SECRETS; do ips="$ips{\"name\":\"$s\"},"; done; ips="[${ips%,}]"
+# 对路径中每个唯一镜像做节点拉取检查
+mapfile -t PULL_IMGS < <(printf '%s\n' "${HOP_IMAGES[@]}" | awk 'NF && !seen[$0]++')
+log "拉取检查镜像: ${PULL_IMGS[*]}"
 i=0
+for pull_img in "${PULL_IMGS[@]}"; do
 for node in "${NODES[@]}"; do
   pod="milvus-upgrader-pullcheck-$i"; PULL_PODS+=("$pod")
   ksa -n "$NS" delete pod "$pod" --ignore-not-found --wait=true >/dev/null 2>&1 || true
@@ -271,11 +316,12 @@ for node in "${NODES[@]}"; do
 {"apiVersion":"v1","kind":"Pod","metadata":{"name":"$pod","namespace":"$NS","labels":{"app.kubernetes.io/managed-by":"milvus-oneshot-upgrade"}},
  "spec":{"nodeName":"$node","restartPolicy":"Never","automountServiceAccountToken":false,"imagePullSecrets":$ips,
   "tolerations":[{"operator":"Exists"}],"terminationGracePeriodSeconds":0,
-  "containers":[{"name":"pullcheck","image":"$TARGET_IMAGE","imagePullPolicy":"IfNotPresent","command":["/bin/sh","-c","exit 0"],
+  "containers":[{"name":"pullcheck","image":"$pull_img","imagePullPolicy":"IfNotPresent","command":["/bin/sh","-c","exit 0"],
    "resources":{"requests":{"cpu":"10m","memory":"16Mi"},"limits":{"cpu":"100m","memory":"64Mi"}}}]}}
 JSON
   ksa create -f "$TMP/$pod.json" >/dev/null
-  log "已创建 $pod -> 节点 $node"; i=$((i+1))
+  log "已创建 $pod -> 节点 $node 镜像 $pull_img"; i=$((i+1))
+done
 done
 for pod in "${PULL_PODS[@]}"; do
   t0=$(date +%s); res=""
@@ -547,30 +593,70 @@ fix_nodeports(){
 fix_nodeports || die 7 "固定 serviceType 后 nodePort 无法恢复"
 log "nodePort 与快照一致"
 T_UP=$(date +%s)
-log "patch 镜像 + securityContext"
-ksa -n "$NS" patch milvus "$NAME" --type merge -p "{\"spec\":{\"components\":{\"image\":\"$TARGET_IMAGE\",\"securityContext\":{\"runAsUser\":0,\"runAsNonRoot\":false}}}}"
-lastp=-100
-while :; do
-  el=$(( $(date +%s) - T_UP ))
-  st=$(cr '{.status.status}'); up=$(cr '{.status.conditions[?(@.type=="MilvusUpdated")].status}'); ci=$(cr '{.status.currentImage}')
-  pods=$(ksa -n "$NS" get pods -l "$MSEL" -o jsonpath='{range .items[*]}{.metadata.name}|{.spec.containers[0].image}|{.status.containerStatuses[0].ready}|{.status.containerStatuses[0].restartCount}|{.status.containerStatuses[0].state.waiting.reason}|{.metadata.deletionTimestamp}{"\n"}{end}')
-  if [ $(( el - lastp )) -ge 30 ]; then lastp=$el
-    log "t+${el}s status=$st MilvusUpdated=$up currentImage=${ci##*/}"; echo "$pods" | sed 's/^/      /'; fi
-  allnew=$(echo "$pods" | awk -F'|' -v img="$TARGET_IMAGE" 'NF{n++; if($2==img && $3=="true" && $6=="") ok++} END{print (n>0 && n==ok)?1:0}')
-  if [ "$st" = Healthy ] && [ "$up" = True ] && [ "$ci" = "$TARGET_IMAGE" ] && [ "$allnew" = 1 ]; then break; fi
-  crash=$(echo "$pods" | awk -F'|' -v img="$TARGET_IMAGE" '$2==img && $5=="CrashLoopBackOff" && $4>=3 {print $1}' | head -1)
-  if [ -n "$crash" ]; then
-    log "Pod $crash CrashLoopBackOff，上一次容器日志（末 60 行）:"; ksa -n "$NS" logs "$crash" --previous --tail=60 || true
-    die 7 "升级后 CrashLoop（见上方日志与 SKILL.md 附录坑位）"
+wait_hop_healthy(){
+  local hop_img=$1 hop_tag=$2
+  local lastp=-100 el st up ci pods allnew crash pb ready
+  while :; do
+    el=$(( $(date +%s) - T_HOP ))
+    st=$(cr '{.status.status}'); up=$(cr '{.status.conditions[?(@.type=="MilvusUpdated")].status}'); ci=$(cr '{.status.currentImage}')
+    pods=$(ksa -n "$NS" get pods -l "$MSEL" -o jsonpath='{range .items[*]}{.metadata.name}|{.spec.containers[0].image}|{.status.containerStatuses[0].ready}|{.status.containerStatuses[0].restartCount}|{.status.containerStatuses[0].state.waiting.reason}|{.metadata.deletionTimestamp}{"\n"}{end}')
+    if [ $(( el - lastp )) -ge 30 ]; then lastp=$el
+      log "hop $hop_tag t+${el}s status=$st MilvusUpdated=$up currentImage=${ci##*/}"; echo "$pods" | sed 's/^/      /'; fi
+    allnew=$(echo "$pods" | awk -F'|' -v img="$hop_img" 'NF{n++; if($2==img && $3=="true" && $6=="") ok++} END{print (n>0 && n==ok)?1:0}')
+    if [ "$st" = Healthy ] && [ "$up" = True ] && [ "$ci" = "$hop_img" ] && [ "$allnew" = 1 ]; then return 0; fi
+    if [ "$st" = Healthy ] && [ "$up" = True ] && [ "$ci" = "$hop_img" ]; then
+      ready=$(echo "$pods" | awk -F'|' 'NF{n++; if($3=="true" && $6=="") ok++} END{print (n>0 && n==ok)?1:0}')
+      [ "$ready" = 1 ] && return 0
+    fi
+    crash=$(echo "$pods" | awk -F'|' -v img="$hop_img" '$2==img && $5=="CrashLoopBackOff" && $4>=3 {print $1}' | head -1)
+    if [ -n "$crash" ]; then
+      log "Pod $crash CrashLoopBackOff，上一次容器日志（末 60 行）:"; ksa -n "$NS" logs "$crash" --previous --tail=60 || true
+      die 7 "hop $hop_tag 后 CrashLoop（见上方日志与 SKILL.md 附录坑位）"
+    fi
+    pb=$(echo "$pods" | awk -F'|' '$5=="ImagePullBackOff"||$5=="ErrImagePull" {print $1}' | head -1)
+    if [ -n "$pb" ] && [ $el -ge 300 ]; then die 7 "hop $hop_tag: Pod $pb 拉取镜像失败超过 300s"; fi
+    [ $el -lt "$UPGRADE_TIMEOUT" ] || die 7 "hop $hop_tag 等待 Healthy 超时（${UPGRADE_TIMEOUT}s）"
+    sleep 10
+  done
+}
+apply_hop(){
+  local hop_img=$1 tag=$2 em=$3 am=$4
+  local patch_json cr_yaml comps
+  if [ "$am" = cluster_full_cr ]; then
+    log "hop $tag: Cluster 完整 CR apply（image=$hop_img，显式 indexNode.replicas=0 + securityContext root）"
+    cr_yaml="$TMP/cr-hop-${tag}.yaml"
+    ksa -n "$NS" get milvus "$NAME" -o yaml > "$cr_yaml"
+    comps=$(python3 "$SCRIPT_DIR/rewrite_cr_for_3_0.py" "$cr_yaml" "$hop_img" | awk -F= '/^COMP_KEYS=/{print $2}')
+    log "hop $tag: apply 前 components keys=[${comps:-?}]（若与官方 3.0 Cluster 模板差异大，请先非生产验证）"
+    ksa -n "$NS" apply -f "$cr_yaml"
+  else
+    patch_json="{\"spec\":{\"components\":{\"image\":\"$hop_img\",\"securityContext\":{\"runAsUser\":0,\"runAsNonRoot\":false}"
+    if [ "$em" = 1 ]; then
+      log "hop $tag: merge patch image + 启用 mixCoord（2.5→2.6 官方要求）"
+      patch_json="${patch_json},\"mixCoord\":{}"
+    else
+      log "hop $tag: merge patch image + securityContext"
+    fi
+    patch_json="${patch_json}}}}"
+    ksa -n "$NS" patch milvus "$NAME" --type merge -p "$patch_json"
   fi
-  pb=$(echo "$pods" | awk -F'|' '$5=="ImagePullBackOff"||$5=="ErrImagePull" {print $1}' | head -1)
-  if [ -n "$pb" ] && [ $el -ge 300 ]; then die 7 "Pod $pb 拉取镜像失败超过 300s"; fi
-  [ $el -lt "$UPGRADE_TIMEOUT" ] || die 7 "等待 Healthy 超时（${UPGRADE_TIMEOUT}s）"
-  sleep 10
+}
+hop_i=0
+for meta in "${HOP_META[@]}"; do
+  hop_i=$((hop_i+1))
+  IFS='|' read -r tag em ro am <<<"$meta"
+  hop_img="${REPO_BASE}:${tag}"
+  [ "$ro" = "-" ] || [ -z "$ro" ] || log "hop $tag 要求 operator≥$ro（预检已校验；本 skill 不跨 NS 升级 operator）"
+  step "7.$hop_i 升级 hop → $tag ($am)"
+  T_HOP=$(date +%s)
+  apply_hop "$hop_img" "$tag" "$em" "$am"
+  fix_nodeports || die 7 "hop $tag 后 nodePort 无法恢复"
+  wait_hop_healthy "$hop_img" "$tag"
+  log "hop $tag 完成：Healthy，用时 $(( $(date +%s) - T_HOP ))s"
 done
 UP_SECS=$(( $(date +%s) - T_UP ))
-log "升级完成：Healthy，镜像 $TARGET_IMAGE，用时 ${UP_SECS}s"
-gate upgrade "PASS (${UP_SECS}s)"
+log "全部 hops 完成：Healthy，最终镜像 $TARGET_IMAGE，总用时 ${UP_SECS}s"
+gate upgrade "PASS (${#HOP_META[@]} hops, ${UP_SECS}s)"
 fi
 
 # ---------- 9. 校验 ----------

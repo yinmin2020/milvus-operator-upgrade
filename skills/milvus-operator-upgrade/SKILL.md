@@ -1,6 +1,6 @@
 ---
 name: milvus-operator-upgrade
-description: 在 milvus-operator 部署的 Milvus（命名空间里有 milvus.io/v1beta1 Milvus CR）上实际执行原地升级（只换 Milvus 镜像，如 2.6.x → 3.0.x），或在升级后一键回滚/恢复到升级前版本。触发：用户要真正动手“升级 Milvus”“用 operator 升级 Milvus”“Milvus 升到 3.0”“回滚 Milvus”“恢复升级前的 Milvus”，或 “upgrade Milvus (operator / Milvus CR)”“roll back / restore Milvus after upgrade”。流程固定为：只问命名空间 → 用 scripts/connect.sh（Windows 用 connect.ps1）连接 master（密钥优先，否则系统密码弹窗，密码不经过对话） → 只读预检 --check-only（milvus-backup 0.6.1 是前置条件，skill 不携带也不自动安装：缺失时给出官方下载链接，由用户自行下载并用选项告知位置，agent 绝不联网下载） → 用选项选目标镜像 → 用选项确认风险提示 → 全自动执行（临时 SA、备份、升级、校验、报告、清理）。不适用：Helm 或 docker-compose 部署的 Milvus、首次安装、升级 milvus-operator 本身、跨集群迁移、只要升级方案/建议/排障而不执行（这些交给通用 Milvus 运维 skill，如 milvus-ops-expert）。
+description: 在 milvus-operator 部署的 Milvus（命名空间里有 milvus.io/v1beta1 Milvus CR）上实际执行原地升级（按官方版本路径多跳：可停在选定 2.6.y 或升到 GA 3.0.y；2.5→2.6 含 operator≥1.3.7/mixCoord 引导），或在升级后一键回滚/恢复到升级前版本。触发：用户要真正动手“升级 Milvus”“用 operator 升级 Milvus”“Milvus 升到 3.0”“回滚 Milvus”“恢复升级前的 Milvus”，或 “upgrade Milvus (operator / Milvus CR)”“roll back / restore Milvus after upgrade”。流程固定为：只问命名空间 → 用 scripts/connect.sh（Windows 用 connect.ps1）连接 master（密钥优先，否则系统密码弹窗，密码不经过对话） → 只读预检 --check-only（milvus-backup 0.6.1 是前置条件，skill 不携带也不自动安装：缺失时给出官方下载链接，由用户自行下载并用选项告知位置，agent 绝不联网下载） → 用选项选目标镜像 → 用选项确认风险提示 → 全自动执行（临时 SA、备份、升级、校验、报告、清理）。不适用：Helm 或 docker-compose 部署的 Milvus、首次安装、升级 milvus-operator 本身、跨集群迁移、只要升级方案/建议/排障而不执行（这些交给通用 Milvus 运维 skill，如 milvus-ops-expert）。
 ---
 
 # Milvus Operator 一键升级 / 回滚
@@ -40,16 +40,18 @@ description: 在 milvus-operator 部署的 Milvus（命名空间里有 milvus.io
 ### B. 只读预检（`--check-only`）
 传脚本到 master（见「执行」第 1 步），然后前台运行：
 ```bash
-<SSH> 'bash /root/milvus-upgrade/skill/scripts/oneshot_upgrade.sh <NS> --check-only [--name <CR>] [--target-tag v3.0.3]'
+<SSH> 'bash /root/milvus-upgrade/skill/scripts/oneshot_upgrade.sh <NS> --check-only [--name <CR>] [--target-tag <TAG>]'
 ```
 - 只读：只用管理员 kubeconfig 做 get/list 和 `auth can-i`，**不创建任何集群对象，不写任何文件**，不需要目标镜像。
 - 输出格式（机器可读）：
   - `CHECK <key>=<value>`：事实，如 `cr`、`cr_mode`、`current_image`、`current_version`、`status`、`milvus_updated`、`paused`、`operator_version`、`mq`、`service_type`、`service_ports`、`image_pull_secrets`、`milvus_backup`、`milvus_backup_version`、`master_arch`、`milvus_backup_url`、`milvus_backup_sha256`、`milvus_backup_bin_sha256`、`disk_avail_bytes`。
   - `CHECK_ITEM <项> <PASS|FAIL|WARN|INFO|MISSING> <说明>`：检查结论。`MISSING` 只用于 `milvus_backup`，不是 FAIL。
   - `PREREQ …`：仅缺 milvus-backup 时出现，给出 master 架构、官方下载链接、期望 sha256 和两种放置方式。
-  - `SUGGEST target_image=<当前仓库>:v3.0.3`、`SUGGEST official_image=milvusdb/milvus:v3.0.3`。
+  - `TARGET_OPTION kind=2.6|3.0 tag=… image=… recommended=yes|no label=…`：合法**最终**目标（两端对等：停在 2.6.x 或升到 GA 3.0.y）。省略 `--target-tag` 时列出供 C 选。
+  - `PATH_PLAN` / `HOP` / `PATH_WARN` / `PATH_BLOCK`：选定目标后的路径展开（见 `references/upgrade-paths.md`）。
+  - `SUGGEST target_image=…`、`SUGGEST official_image=…`：兼容旧逻辑的推荐建议（优先推荐 GA 3.0，否则推荐 2.6）。
   - 一张人读表格，最后一行 `CHECK_RESULT rc=N`。
-- 检查项：master 工具、NS、管理员能否建临时 SA/Role/token、CR 及模式、健康（Healthy + MilvusUpdated）、paused、operator 版本、MQ/依赖、Pod Ready、Service 类型与 NodePort（与 CR serviceType 是否一致）、imagePullSecrets、root 运行说明、milvus-backup 是否可用（架构须与 master 一致，架构不符视为未安装）、master 磁盘、NS 锁、版本门槛（官方文档要求当前 ≥ 2.5.16，2.6.0-rc 不支持；目标 3.x 时本 skill 要求当前 ≥ 2.6，已验证 2.6.25 → 3.0.3 @ operator 1.3.12）、目标版本高于当前、鉴权与 RBAC 凭据（`auth_enabled`、`milvus_token`，见「Milvus 鉴权与 RBAC」；开启鉴权但没有可用的 root/admin 凭据 = FAIL）。
+- 检查项：master 工具、NS、管理员能否建临时 SA/Role/token、CR 及模式、健康（Healthy + MilvusUpdated）、paused、operator 版本、MQ/依赖、Pod Ready、Service 类型与 NodePort（与 CR serviceType 是否一致）、imagePullSecrets、root 运行说明、milvus-backup 是否可用（架构须与 master 一致，架构不符视为未安装）、master 磁盘、NS 锁、**版本路径**（官方文档：源发现 CR→status→pods；`<2.5.16` 会经 2.5.16+mixCoord；`2.6.0-rc*` / 目标 beta|rc|alpha **阻断**；2.5 不直达 3.0；2.6.x→3.0 任意 2.6.x 允许，源 `<2.6.20` **软警告**不阻断，已验证参考 2.6.20→3.0.3；**不强制**经 2.6.24；2.5→2.6 需 operator≥1.3.7）、目标高于当前、鉴权与 RBAC 凭据（`auth_enabled`、`milvus_token`，见「Milvus 鉴权与 RBAC」；开启鉴权但没有可用的 root/admin 凭据 = FAIL）。策略表：`scripts/upgrade_paths.json` + `references/upgrade-paths.md`。
 - `rc=0`：全部 PASS（WARN/INFO 不阻断），把表格转述给用户，进入 C。
 - `rc=4` 且有 `NEEDS install_backup`：其余全部通过，只缺前置条件 milvus-backup（`CHECK_ITEM milvus_backup MISSING`），做 B2。
 - `CHECK_ITEM milvus_backup_sha256 WARN`（找到的文件不在已知 0.6.1 清单中）：转述后用选项问「仍然使用（未经验证）/ 取消（换官方 0.6.1，回到 B2）」，选前者才进入 C。
@@ -74,24 +76,28 @@ description: 在 milvus-operator 部署的 Milvus（命名空间里有 milvus.io
    rc：0 成功/已存在；1 ssh 不通（重新 connect）；2 路径不存在或参数错（回到第 2 步）；3 架构不符（让用户下载与 `master_arch` 对应的包，回到第 2 步）；5 传输/解压失败、6 自检失败（转述并停止）；4 sha256 不在已知清单、7 版本不是 0.6.1（只验证过 0.6.1）：转述期望/实际值，用选项问 `重新下载官方 0.6.1 后提供新路径（推荐）` / `仍然使用此文件（未经验证，风险自担）` / `取消`，只有选第二项才加 `--allow-unverified`（ps1：`-AllowUnverified`）重跑。
 4. 重跑 B 只有 `rc=0` 才进入 C；仍是 `rc=4` 时转述 MISSING 说明里的不可用原因（如架构不符、无执行权限），回到第 2 步。
 
-### C. 选择目标镜像（预检通过后）
-用结构化选项提问，选项固定为（`<repo>` 取自 `SUGGEST target_image` 去掉 tag）：
-1. 沿用当前仓库 `<repo>:v3.0.3`（推荐）
-2. 官方 `milvusdb/milvus:v3.0.3`
-3. 自定义输入（只有选了这一项才让用户输入完整镜像地址）
+### C. 选择最终目标（预检通过后；两端对等）
+用结构化选项提问。**优先**把 B 输出的每条 `TARGET_OPTION` 做成选项（`label` 人读，`image` 为值）；再追加一项「自定义输入完整镜像」。
 
-用户选了 2 或 3 时，镜像与 B 预检里的 tag 不同，就带上该镜像再跑一次 `--check-only <NS> <镜像>`，确认版本门槛仍然 PASS。
+规则：
+- 两端对等：**(A) 停在选定 2.6.y** 与 **(B) 升到 GA 3.0.y** 都是合法终点；不要默认逼用户去 3.0。
+- `recommended=yes` 的项可标「推荐」，但 2.6 与 3.0 各可有一个推荐，并列展示。
+- 若 B 未带 `--target-tag`/`TARGET_IMAGE`，必须先完成本步再进 D。
+- 用户选定后，带该镜像再跑一次 `--check-only <NS> <镜像>`（或 `--target-tag`），确认 `PATH_PLAN`/`version_path` PASS（软警告 PATH_WARN 转述但不阻断）。若 `PATH_BLOCK` 或 FAIL → 不要进入 D。
+- 自定义输入同理：必须再跑预检。
 
 ### D. 风险提示 + 确认
 把下面的风险提示原样展示（替换 `<NS>` `<TARGET_IMAGE>`），再用结构化选项问：`确认升级` / `取消`。只有选了「确认升级」才启动（带 `--yes`），其他任何回答都视为取消。
 
 ```
 ================ 风险提示 ================
-将对命名空间 [<NS>] 中的 Milvus 原地升级到 [<TARGET_IMAGE>]，全程无人值守，任一关卡失败即停止：
-1. 修改 Milvus CR：spec.components.image=目标镜像（只换 Milvus 镜像，etcd/MinIO/MQ 及其镜像不动），
-   并设置 spec.components.securityContext={runAsUser:0, runAsNonRoot:false}（容器以 root 运行）。
-   【与官方文档的差异】官方只 patch spec.components.image；这里额外改为 root，因为 2.6 写入的 rocksmq/缓存文件属主是 root，
+将对命名空间 [<NS>] 中的 Milvus 按版本路径原地升级到 [<TARGET_IMAGE>]（可能多跳；可停在 2.6.x 或升到 GA 3.0.y），全程无人值守，任一关卡失败即停止：
+1. 按官方文档展开 hops（见 references/upgrade-paths.md）：可能先要求 operator≥1.3.7（由你在 operator 命名空间完成，本 skill 不跨 NS 改 operator）、
+   Cluster 启用 mixCoord、经 ≥2.5.16 / 2.6.x 桥接，再改 Milvus 镜像；etcd/MinIO/MQ 及其镜像不动。
+   每跳设置 securityContext={runAsUser:0, runAsNonRoot:false}（容器以 root 运行）。
+   【与官方文档的差异】官方 2.6→3.0 Standalone 只 patch image；这里额外改为 root，因为 2.6 写入的 rocksmq/缓存文件属主是 root，
    3.0 镜像默认非 root 用户启动会 Permission denied/CrashLoop。若安全策略不允许 root 容器，请取消。
+   Cluster→3.0：倾向完整 CR apply（显式 indexNode.replicas=0），保留现有拓扑；组件与官方模板差异大时请先非生产验证。
    Service 为 NodePort/LoadBalancer 时把 CR 的 serviceType 固定为同类型（nodePort 漂移则改回快照值）。
 2. 在 [<NS>] 临时创建 SA/Role/RoleBinding "milvus-upgrader" 和短期 token，结束（含失败）自动删除；之后所有操作都用该 SA 身份执行。
 3. 用 milvus-backup 做全量备份 pre_upgrade_<时间戳>（始终带 --rbac：用户、角色、授权一并备份；备份含密码哈希，仅存放在 MinIO 和 master 本地导出里），
@@ -202,7 +208,7 @@ Windows（tmpkey）：`ssh -i "<SSH_KEY>" -o IdentitiesOnly=yes -o BatchMode=yes
 4. `rc=0` 时，读取 `<run_dir>/report.md` 并把结果表发给用户，内容包括：镜像前后、CR 状态、Service/nodePort 前后、备份名和位置、探针结果、各关卡、耗时。同时提醒用户保留备份，直到业务确认无误。
 5. 无论结果如何（成功、失败、取消），最后关闭连接（见「连接方式」）。
 
-可选参数（用户没提就不问）：`--rbac-test`（及 `--rbac-test-collection`、`--rbac-test-deny`，见「Milvus 鉴权与 RBAC」）、`--name <CR>`、`--backup-bin <路径>`（默认依次查找 `/root/milvus-upgrade/milvus-backup`（B2 放置/安装位置）、`/root/milvus-backup/milvus-backup`、`/usr/local/bin`、`PATH`，以及 `/root/milvus-upgrade/` 或 `/root/` 下的 `milvus-backup_*_Linux_*.tar.gz`；架构与 master 不符的自动跳过）、`--probe-collection <已 load 的集合>`、`--export-dir <目录>` / `--no-export`（跳过后一键恢复只能依赖 MinIO 里仍在的备份）、`--operator-ns`、`--upgrade-timeout 1200`、`--pull-timeout 900`、`--token-ttl 3h`、`--workdir /root/milvus-upgrade`、`--target-tag v3.0.3`（仅 `--check-only`）。
+可选参数（用户没提就不问）：`--rbac-test`（及 `--rbac-test-collection`、`--rbac-test-deny`，见「Milvus 鉴权与 RBAC」）、`--name <CR>`、`--backup-bin <路径>`（默认依次查找 `/root/milvus-upgrade/milvus-backup`（B2 放置/安装位置）、`/root/milvus-backup/milvus-backup`、`/usr/local/bin`、`PATH`，以及 `/root/milvus-upgrade/` 或 `/root/` 下的 `milvus-backup_*_Linux_*.tar.gz`；架构与 master 不符的自动跳过）、`--probe-collection <已 load 的集合>`、`--export-dir <目录>` / `--no-export`（跳过后一键恢复只能依赖 MinIO 里仍在的备份）、`--operator-ns`、`--upgrade-timeout 1200`、`--pull-timeout 900`、`--token-ttl 3h`、`--workdir /root/milvus-upgrade`、`--target-tag <TAG>`（仅 `--check-only`；省略则列出 TARGET_OPTION）。
 
 下列信息自动获取，不要问用户：CR 名（NS 内只有一个时）、standalone 或 cluster、当前镜像、MQ 类型、operator 位置、版本和镜像、imagePullSecrets、Milvus 所在节点、MinIO 和 etcd 的地址、bucket 与 rootPath（读 `<CR>` ConfigMap 的 user.yaml，不用 CR 里的 chart 值）、Service 快照。
 

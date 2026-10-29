@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """只读预检（不创建、不修改任何集群对象，不写任何文件）。
 用法:
-  check.py upgrade <NS> [--name CR] [--target-tag v3.0.3] [--target-image IMG] [--backup-bin PATH] [--workdir DIR] [--operator-ns ONS]
+  check.py upgrade <NS> [--name CR] [--target-tag TAG] [--target-image IMG] [--backup-bin PATH] [--workdir DIR] [--operator-ns ONS]
   check.py restore <NS> [--name CR] [--backup-bin PATH] [--workdir DIR]
 只用管理员 kubeconfig 做 get/list 和 auth can-i（SelfSubjectAccessReview 不落盘），不读 Secret。
 输出: CHECK key=value（事实）、CHECK_ITEM name STATUS detail（PASS/FAIL/WARN/INFO/MISSING）、SUGGEST key=value、人读表格、
@@ -10,12 +10,15 @@
       4 只缺 milvus-backup（前置条件；打印 NEEDS install_backup、官方下载链接与期望 sha256，由用户自行下载并告知位置）| 5 有 FAIL 项）。
 """
 import argparse, fcntl, glob, json, os, re, shutil, socket, stat, subprocess, sys, time
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+import upgrade_paths as upaths
 
 ap = argparse.ArgumentParser()
 ap.add_argument('mode', choices=['upgrade', 'restore'])
 ap.add_argument('ns')
 ap.add_argument('--name', default='')
-ap.add_argument('--target-tag', default='v3.0.3')
+ap.add_argument('--target-tag', default='', help='最终目标 tag（如 v3.0.3）；省略则只列出合法终点')
 ap.add_argument('--target-image', default='')
 ap.add_argument('--backup-bin', default=os.environ.get('MILVUS_BACKUP_BIN', ''))
 ap.add_argument('--workdir', default='/root/milvus-upgrade')
@@ -45,10 +48,18 @@ def finish(rc):
     sys.exit(rc)
 
 def ver(img):
-    m = re.search(r':v?(\d+)\.(\d+)\.(\d+)', img or '')
-    return tuple(int(x) for x in m.groups()) if m else None
+    """GA tuple (maj,min,pat) or None. Pre-release returns None here; use ver_full()."""
+    v = upaths.parse_version(img or '')
+    if not v or v['channel'] != 'ga':
+        return None
+    return v['tuple']
+
+def ver_full(img):
+    return upaths.parse_version(img or '')
 
 def vs(t):
+    if isinstance(t, dict):
+        return upaths.v_str(t)
     return '.'.join(map(str, t)) if t else '?'
 
 fact('mode', a.mode); fact('namespace', a.ns)
@@ -103,8 +114,15 @@ if cr is None:
 name = cr['metadata']['name']; spec = cr.get('spec', {}); st = cr.get('status', {}) or {}
 comp = spec.get('components', {}) or {}; deps = spec.get('dependencies', {}) or {}
 mode = spec.get('mode', 'standalone')
-img = comp.get('image', ''); cur_img = st.get('currentImage', '') or img
-fact('cr', name); fact('cr_mode', mode); fact('current_image', img); fact('current_version', vs(ver(img)))
+img = comp.get('image', ''); status_img = st.get('currentImage', '') or ''
+_src_chosen, _ = upaths.discover_source(img, status_img, [])
+cur_img = (_src_chosen or {}).get('image') or status_img or img
+src_ver = (_src_chosen or {}).get('version') or ver_full(cur_img)
+fact('cr', name); fact('cr_mode', mode); fact('current_image', img); fact('status_current_image', status_img)
+fact('current_version', (src_ver['tag'].lstrip('v') if isinstance(src_ver, dict) and src_ver.get('tag') else vs(ver(img))))
+fact('source_discovery', (_src_chosen or {}).get('source', 'none'))
+has_mixcoord = bool(comp.get('mixCoord'))
+fact('has_mixcoord', 'true' if has_mixcoord else 'false')
 item('cr', 'PASS', '%s/%s (%s)' % (a.ns, name, mode))
 
 # 4b. 鉴权 / RBAC：开启鉴权时必须提供 root/admin 凭据（备份与恢复 RBAC 都要它）
@@ -209,6 +227,20 @@ notready = [p['metadata']['name'] for p in mine if not all(c.get('ready') for c 
 nodes = sorted({p['spec'].get('nodeName', '') for p in mine if (p['metadata'].get('labels') or {}).get('app.kubernetes.io/instance') == name})
 fact('pods', len(mine)); fact('milvus_nodes', ','.join(nodes))
 item('pods_ready', ('PASS' if not notready else ('FAIL' if a.mode == 'upgrade' else 'INFO')), ('%d 个 Pod 全部 Ready' % len(mine)) if not notready else ('未 Ready: ' + ' '.join(notready)))
+# 用 Pod 镜像补全源版本（CR/status 解析失败时）
+_pod_imgs = []
+for _p in mine:
+    if (_p['metadata'].get('labels') or {}).get('app.kubernetes.io/instance') != name:
+        continue
+    for _c in ((_p.get('spec') or {}).get('containers') or []):
+        if _c.get('image'):
+            _pod_imgs.append(_c['image'])
+_src2, _ = upaths.discover_source(img, status_img, _pod_imgs)
+if _src2:
+    cur_img = _src2['image']; src_ver = _src2['version']
+    fact('current_image_resolved', cur_img)
+    fact('current_version', src_ver['tag'].lstrip('v'))
+    fact('source_discovery', _src2['source'])
 
 # 9. Service / NodePort
 rc, out, _ = k('-n', a.ns, 'get', 'svc', '-l', 'app.kubernetes.io/instance=' + name, '-o', 'json')
@@ -359,26 +391,97 @@ if os.path.exists(lk):
             busy = True
 item('lock', 'FAIL' if busy else 'PASS', ('同一 NS 已有升级/恢复在运行（%s）' % lk) if busy else '无正在运行的升级/恢复')
 
-cv = ver(img)
-repo = re.sub(r'(@sha256:[0-9a-f]+|:[A-Za-z0-9_.-]+)$', '', img)
+# 版本路径（官方文档；见 references/upgrade-paths.md + scripts/upgrade_paths.py）
+repo = upaths.repo_of(img or cur_img)
+src_ver = src_ver or ver_full(cur_img or img)
+cv = ver(cur_img or img)  # GA tuple or None
+policy = upaths.load_policy()
+pins = policy['pins']
 if a.mode == 'upgrade':
-    tgt = a.target_image or (repo + ':' + a.target_tag)
-    tv = ver(tgt)
-    fact('suggested_target_image', tgt); fact('official_target_image', 'milvusdb/milvus:' + (a.target_tag if not a.target_image else (tgt.rsplit(':', 1)[-1])))
-    print('SUGGEST target_image=%s' % tgt)
-    print('SUGGEST official_image=milvusdb/milvus:%s' % (a.target_tag if not a.target_image else tgt.rsplit(':', 1)[-1]))
-    if not cv:
-        item('version_doc', 'WARN', '无法从镜像 tag 解析当前版本: ' + img)
+    # 源版本硬门槛
+    if not src_ver:
+        item('version_source', 'WARN', '无法从 CR/status/pods 解析当前版本（image=%s）' % (cur_img or img))
     else:
-        rc1 = bool(re.search(r':v?2\.6\.0-rc', img))
-        item('version_doc', 'PASS' if cv >= (2, 5, 16) and not rc1 else 'FAIL', '当前 %s；官方文档要求 ≥ 2.5.16 才能升级到 2.6/3.x%s' % (vs(cv), '；2.6.0-rc1 官方不支持直接升级' if rc1 else ''))
-        if tv and tv[0] >= 3:
-            item('version_tested', 'PASS' if cv >= (2, 6, 0) else 'FAIL', '目标 %s：本 skill 要求当前 ≥ 2.6（已验证 2.6.25 → 3.0.3 @ operator 1.3.12）' % vs(tv))
-        if tv:
+        sb = upaths.is_blocked_source(src_ver)
+        if sb:
+            item('version_source', 'FAIL', sb + ' 文档: ' + policy['docs']['cluster_2_5_to_2_6'])
+        else:
+            item('version_source', 'PASS', '源 %s（发现自 %s）' % (src_ver['tag'], dict(FACTS).get('source_discovery', '?')))
+
+    # 列出合法终点（两端对等：停在 2.6.x 或升到 GA 3.0.y）
+    if src_ver and not upaths.is_blocked_source(src_ver):
+        opts, _ob = upaths.list_options(src_ver, repo=repo or 'milvusdb/milvus', mode=mode, policy=policy)
+        for o_ in opts:
+            print('TARGET_OPTION kind=%s tag=%s image=%s recommended=%s label=%s' % (
+                o_['kind'], o_['tag'], o_['image'], 'yes' if o_['recommended'] else 'no',
+                o_['label'].replace(' ', '_')))
+        fact('target_options', len(opts))
+        # 默认推荐建议（供兼容旧 SUGGEST 行）：优先推荐 3.0，否则推荐 2.6
+        rec = next((o_ for o_ in opts if o_['recommended'] and o_['kind'] == '3.0'), None) \
+            or next((o_ for o_ in opts if o_['recommended']), None) \
+            or (opts[0] if opts else None)
+        if rec:
+            print('SUGGEST target_image=%s' % rec['image'])
+            print('SUGGEST official_image=milvusdb/milvus:%s' % rec['tag'])
+            fact('suggested_target_image', rec['image'])
+            fact('official_target_image', 'milvusdb/milvus:%s' % rec['tag'])
+
+    # 若用户已选定目标：校验 + 展开 hops
+    tgt = a.target_image or ((repo + ':' + a.target_tag) if a.target_tag else '')
+    if tgt:
+        tv_full = ver_full(tgt)
+        tv = ver(tgt)
+        fact('requested_target_image', tgt)
+        print('SUGGEST target_image=%s' % tgt)
+        print('SUGGEST official_image=milvusdb/milvus:%s' % (tgt.rsplit(':', 1)[-1]))
+        tb = upaths.is_blocked_target(tv_full) if tv_full else '无法解析目标版本: ' + tgt
+        if tb:
+            item('version_target', 'FAIL', tb)
+        elif not src_ver:
+            item('version_path', 'WARN', '有目标但源版本未解析，跳过路径展开')
+        else:
+            plan = upaths.plan_hops(
+                src_ver, tv_full, mode=mode, has_mixcoord=has_mixcoord,
+                operator_ver=opver or opimg, policy=policy)
+            for w in plan['warns']:
+                print('PATH_WARN %s' % w)
+                item('version_path_warn', 'WARN', w[:240])
+            for i_ in plan['infos']:
+                print('PATH_INFO %s' % i_)
+            for b in plan['blocks']:
+                print('PATH_BLOCK %s' % b)
+            if plan['blocks']:
+                item('version_path', 'FAIL', plan['blocks'][0][:300])
+            else:
+                tags = []
+                for i_, h in enumerate(plan['hops'], 1):
+                    tags.append(h['tag'])
+                    print('HOP index=%d tag=%s enable_mixcoord=%d require_operator_ge=%s apply_mode=%s note=%s' % (
+                        i_, h['tag'], 1 if h['enable_mixcoord'] else 0,
+                        h.get('require_operator_ge') or '-', h['apply_mode'],
+                        (h.get('note') or '').replace('\n', ' ')[:200]))
+                print('PATH_PLAN final=%s hops=%s' % (plan['final'], ','.join(tags)))
+                fact('path_hops', ','.join(tags))
+                item('version_path', 'PASS', '%s → %s via %s' % (src_ver['tag'], plan['final'], ','.join(tags) or '(none)'))
+                # 软提示：2.6.x < verified 已在 WARN；cluster→3.0 完整 CR
+                if any(h['apply_mode'] == 'cluster_full_cr' for h in plan['hops']):
+                    item('cluster_apply', 'INFO',
+                         '目标含 3.0 Cluster：文档要求完整 CR apply（显式 indexNode.replicas=0），'
+                         '不要只用缺字段的 image-only merge。本 skill 会按现有 CR 拓扑生成 apply；'
+                         '若组件与官方模板差异较大请先非生产验证。文档: ' + policy['docs']['cluster_2_6_to_3_0'])
             if cur_img == tgt and status == 'Healthy':
                 item('target', 'INFO', '已是目标镜像 %s，正式运行将只做校验（ALREADY）' % tgt)
-            else:
+            elif tv and cv:
                 item('target', 'PASS' if tv > cv else 'FAIL', '%s → %s%s' % (vs(cv), vs(tv), '' if tv > cv else '（不支持降级/同版本）'))
+            elif tv_full and src_ver:
+                item('target', 'PASS', '%s → %s' % (src_ver['tag'], tv_full['tag']))
+    else:
+        item('version_target', 'INFO', '未指定最终目标：请用 TARGET_OPTION 选项框选择终点（停在 2.6.x 或升到 GA 3.0.y），两端对等')
+
+    # 源 <2.5.16：不阻断「选终点」，但会在 plan 里插入 2.5.16 hop；这里 INFO
+    if src_ver and src_ver['channel'] == 'ga' and src_ver['tuple'] < (2, 5, 16):
+        item('version_bridge', 'INFO', '源 <2.5.16：正式路径会先跳到 %s（+Cluster mixCoord），见官方 2.5→2.6 文档' % pins['bridge_2_5_with_mixcoord'])
+
     item('image_pull', 'INFO', '只读模式不建 Pod；正式运行会在 Milvus 所在节点（%s）做拉取检查' % (','.join(nodes) or '?'))
 else:
     metas = []
