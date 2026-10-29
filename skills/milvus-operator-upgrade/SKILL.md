@@ -42,13 +42,16 @@ description: 在 milvus-operator 部署的 Milvus（命名空间里有 milvus.io
 ```bash
 <SSH> 'bash /root/milvus-upgrade/skill/scripts/oneshot_upgrade.sh <NS> --check-only [--name <CR>] [--target-tag <TAG>]'
 ```
-- 只读：只用管理员 kubeconfig 做 get/list 和 `auth can-i`，**不创建任何集群对象，不写任何文件**，不需要目标镜像。
+- 只读：只用管理员 kubeconfig 做 get/list 和 `auth can-i`，**不创建任何集群对象，不写任何文件**，不拉镜像。唯一的外部访问是对镜像仓库做只读 manifest 查询（`scripts/registry_check.py`：registry v2 `HEAD /v2/<repo>/manifests/<tag>`，公开仓库走匿名 token；不下载 layer、不读任何凭据文件），用来确认候选/目标镜像在用户当前使用的仓库或镜像源里真实存在。设 `MILVUS_REGISTRY_CHECK=0` 可关闭（全部视为 unverified）。
 - 输出格式（机器可读）：
   - `CHECK <key>=<value>`：事实，如 `cr`、`cr_mode`、`current_image`、`current_version`、`status`、`milvus_updated`、`paused`、`operator_version`、`mq`、`service_type`、`service_ports`、`image_pull_secrets`、`milvus_backup`、`milvus_backup_version`、`master_arch`、`milvus_backup_url`、`milvus_backup_sha256`、`milvus_backup_bin_sha256`、`disk_avail_bytes`。
   - `CHECK_ITEM <项> <PASS|FAIL|WARN|INFO|MISSING> <说明>`：检查结论。`MISSING` 只用于 `milvus_backup`，不是 FAIL。
   - `PREREQ …`：仅缺 milvus-backup 时出现，给出 master 架构、官方下载链接、期望 sha256 和两种放置方式。
-  - `TARGET_OPTION kind=2.6|3.0 tag=… image=… recommended=yes|no label=…`：合法**最终**目标（两端对等：停在 2.6.x 或升到 GA 3.0.y）。省略 `--target-tag` 时列出供 C 选。
-  - `PATH_PLAN` / `HOP` / `PATH_WARN` / `PATH_BLOCK`：选定目标后的路径展开（见 `references/upgrade-paths.md`）。
+  - `TARGET_OPTION kind=2.6|3.0 tag=… image=… recommended=yes|no pull=present|unverified hops=vA,vB order=N label=…`：可选的合法**最终**目标（两端对等：停在 2.6.x 或升到 GA 3.0.y）。列出 `upgrade_paths.json` 里**所有**高于源版本的 GA 2.6.x 和 GA 3.0.y（不含 rc/beta/alpha，不含 ≤ 源版本），按 `order` 排：推荐项在前，其余从新到旧。省略 `--target-tag` 时列出供 C 选。`pull=unverified` = 仓库 API 无法确认（网络不通/私有仓库），仍可选但要告诉用户。
+  - `TARGET_UNAVAILABLE kind=… tag=… image=… reason=image_not_found missing=<不存在的 hop 镜像>`：该终点（或其路径上的某一跳）在当前仓库/镜像源里**不存在**，**不可选**，只在文字里列出。
+  - `TARGET_GROUP kind=2.6|3.0 available=N unavailable=M recommended=v… newest=v… oldest=v…`：每个终态系列一行摘要，供 C1 使用。
+  - `IMAGE_CHECK image=… status=present|absent|unverified via=registry_api|docker_manifest_inspect|skopeo_inspect|local:crictl|local:ctr|disabled detail=…`：每个镜像的仓库检查结果。若钉选的推荐 tag 在仓库里不存在，推荐自动改为该系列中仓库里存在的最新版。
+  - `PATH_PLAN` / `HOP` / `PATH_WARN` / `PATH_BLOCK`：选定目标后的路径展开（见 `references/upgrade-paths.md`）。选定目标后另有 `CHECK_ITEM target_image_pull PASS|WARN|FAIL`：路径上**每一跳**镜像都做仓库检查；任一跳不存在 = FAIL（rc=5，什么都没改）；无法确认 = WARN（正式运行第 4 步节点拉取检查兜底）。目标 tag 不在已知 GA 列表时有 PATH_WARN（仓库里存在才允许继续）。
   - `SUGGEST target_image=…`、`SUGGEST official_image=…`：兼容旧逻辑的推荐建议（优先推荐 GA 3.0，否则推荐 2.6）。
   - 一张人读表格，最后一行 `CHECK_RESULT rc=N`。
 - 检查项：master 工具、NS、管理员能否建临时 SA/Role/token、CR 及模式、健康（Healthy + MilvusUpdated）、paused、operator 版本、MQ/依赖、Pod Ready、Service 类型与 NodePort（与 CR serviceType 是否一致）、imagePullSecrets、root 运行说明、milvus-backup 是否可用（架构须与 master 一致，架构不符视为未安装）、master 磁盘、NS 锁、**版本路径**（官方文档：源发现 CR→status→pods；`<2.5.16` 会经 2.5.16+mixCoord；`2.6.0-rc*` / 目标 beta|rc|alpha **阻断**；2.5 不直达 3.0；2.6.x→3.0 任意 2.6.x 允许，源 `<2.6.20` **软警告**不阻断，已验证参考 2.6.20→3.0.3；**不强制**经 2.6.24；2.5→2.6 需 operator≥1.3.7）、目标高于当前、鉴权与 RBAC 凭据（`auth_enabled`、`milvus_token`，见「Milvus 鉴权与 RBAC」；开启鉴权但没有可用的 root/admin 凭据 = FAIL）。策略表：`scripts/upgrade_paths.json` + `references/upgrade-paths.md`。
@@ -77,14 +80,31 @@ description: 在 milvus-operator 部署的 Milvus（命名空间里有 milvus.io
 4. 重跑 B 只有 `rc=0` 才进入 C；仍是 `rc=4` 时转述 MISSING 说明里的不可用原因（如架构不符、无执行权限），回到第 2 步。
 
 ### C. 选择最终目标（预检通过后；两端对等）
-用结构化选项提问。**优先**把 B 输出的每条 `TARGET_OPTION` 做成选项（`label` 人读，`image` 为值）；再追加一项「自定义输入完整镜像」。
+B 会列出**全部**受支持的 GA 版本（例如源 2.5.x 时 2.6.0–2.6.26 共 27 个 + 3.0.0–3.0.4 共 5 个，再去掉仓库里没有的），一个选项框放不下（Claude Code AskUserQuestion 最多 4 项 + 自动「Other」；其他宿主约 6 项 + allowCustom）。所以分两步选，用户想升哪个版本都能选到：
+
+**C0. 先用文字列出完整清单**（在弹框前，紧凑一行一系列，从新到旧），例如：
+```
+可选 2.6.x（26 个，推荐 v2.6.25）：v2.6.25 v2.6.23 v2.6.20 v2.6.11 v2.6.10 …
+可选 3.0.y（2 个，推荐 v3.0.3）：v3.0.3 v3.0.1
+镜像仓库中不存在（不可选）：v3.0.4 v2.6.26 …
+pull=unverified（无法确认，可选但需留意）：…
+```
+清单来自 `TARGET_OPTION`（可选）与 `TARGET_UNAVAILABLE`（不可选）。
+
+**C1. 选终态**（一个选项框）：每个 `TARGET_GROUP` 中 `available>0` 的系列一项，例如 `停在 2.6.x（推荐 v2.6.25；共 26 个可选）`、`升到 GA 3.0.y（推荐 v3.0.3；共 2 个可选）`；再加 `自定义输入完整镜像`（allowCustom）。`available=0` 的系列不出现（在文字里说明原因：仓库里没有该系列镜像）。只有一个系列可选时也照样问，不要替用户决定。
+
+**C2. 选该系列里的具体版本**（一个选项框）：
+- 第 1 页：该系列 `recommended=yes` 的项放第一（label 标「推荐」），再按 `order` 取其余最新的若干项（AskUserQuestion 共 3 项版本 + 1 项 `更早版本…`；6 项宿主可放 5 项版本 + `更早版本…`），并开启 allowCustom / Other：用户可以直接输入清单里的任一 tag（如 `v2.6.10`）。
+- 选 `更早版本…` → 下一页继续按从新到旧列出，直到列完；最后一页不再放 `更早版本…`。
+- 用户输入的 tag 必须在可选清单里；若在 `TARGET_UNAVAILABLE` 里，告诉用户「仓库中不存在该镜像」并回到 C2；不在任何清单里（未知 tag / rc / beta / ≤ 源版本）按自定义镜像处理，必须重跑预检，由脚本判定。
+- 绝不把 `TARGET_UNAVAILABLE` 的版本做成可选项。
 
 规则：
-- 两端对等：**(A) 停在选定 2.6.y** 与 **(B) 升到 GA 3.0.y** 都是合法终点；不要默认逼用户去 3.0。
-- `recommended=yes` 的项可标「推荐」，但 2.6 与 3.0 各可有一个推荐，并列展示。
+- 两端对等：**(A) 停在选定 2.6.y** 与 **(B) 升到 GA 3.0.y** 都是合法终点；不要默认逼用户去 3.0。2.6 与 3.0 各可有一个推荐。
 - 若 B 未带 `--target-tag`/`TARGET_IMAGE`，必须先完成本步再进 D。
-- 用户选定后，带该镜像再跑一次 `--check-only <NS> <镜像>`（或 `--target-tag`），确认 `PATH_PLAN`/`version_path` PASS（软警告 PATH_WARN 转述但不阻断）。若 `PATH_BLOCK` 或 FAIL → 不要进入 D。
-- 自定义输入同理：必须再跑预检。
+- 用户选定后，带该镜像再跑一次 `--check-only <NS> <镜像>`（或 `--target-tag`），确认 `PATH_PLAN`/`version_path` PASS，且 `target_image_pull` 为 PASS 或 WARN（软警告 PATH_WARN、`target_image_pull WARN` 转述但不阻断）。`PATH_BLOCK`、`target_image_pull FAIL` 或其他 FAIL → 不要进入 D，回到 C 让用户换版本。
+- 自定义输入同理：必须再跑预检；仓库里拉不到的镜像在预检阶段就 FAIL。
+- 正式运行在改动任何 Milvus 对象前会再做一次同样的仓库检查（`registry_check.txt`），不存在则 rc=5 退出；之后第 4 步还会在 Milvus 所在节点用临时 Pod 实际拉取检查。
 
 ### D. 风险提示 + 确认
 把下面的风险提示原样展示（替换 `<NS>` `<TARGET_IMAGE>`），再用结构化选项问：`确认升级` / `取消`。只有选了「确认升级」才启动（带 `--yes`），其他任何回答都视为取消。

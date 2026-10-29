@@ -5,14 +5,16 @@
 机器可读入口：
   python3 upgrade_paths.py parse <image-or-tag>
   python3 upgrade_paths.py discover --cr-image I [--status-image S] [--pod-images a,b]
-  python3 upgrade_paths.py options --source V [--repo R] [--mode standalone|cluster]
+  python3 upgrade_paths.py options --source V [--repo R] [--mode standalone|cluster] [--unavailable v2.6.26,v3.0.4]
   python3 upgrade_paths.py plan --source V --target T [--mode standalone|cluster] [--has-mixcoord 0|1] [--operator V]
   python3 upgrade_paths.py selftest
 
 输出约定（plan/options）：
   PARSE ok=… major=… minor=… patch=… pre=… channel=ga|rc|beta|alpha|other tag=…
   SOURCE …（discover）
-  TARGET_OPTION kind=2.6|3.0 tag=vX.Y.Z image=… recommended=yes|no label=…
+  TARGET_GROUP kind=2.6|3.0 available=N unavailable=M recommended=v… newest=v… oldest=v…
+  TARGET_OPTION kind=2.6|3.0 tag=vX.Y.Z image=… recommended=yes|no pull=present|unverified|unchecked order=N label=…
+  TARGET_UNAVAILABLE kind=… tag=… image=… reason=image_not_found   （不可选）
   PATH_PLAN final=… hops=vA,vB,…  （每跳细节见 HOP 行）
   HOP index=N tag=v… enable_mixcoord=0|1 require_operator_ge=… apply_mode=merge|cluster_full_cr note=…
   PATH_WARN … / PATH_BLOCK … / PATH_INFO …
@@ -179,8 +181,31 @@ def operator_tuple(s):
     v = parse_version(s)
     return v['tuple'] if v else None
 
+def ga_list(policy, family):
+    """全部受支持 GA 版本（family='2_6' 或 '3_0'）。旧 policy 只有 offer_* 时回退。"""
+    return list(policy.get('ga_' + family) or policy.get('offer_' + family) or [])
+
+def order_options(opts):
+    """展示顺序：推荐项在前（2.6 推荐、3.0 推荐），其余按版本从新到旧（3.0 新→旧，再 2.6 新→旧）。"""
+    rec = [o for o in opts if o['recommended']]
+    rec.sort(key=lambda o: (0 if o['kind'] == '2.6' else 1))
+    rest = [o for o in opts if not o['recommended']]
+    rest.sort(key=lambda o: o['version']['tuple'], reverse=True)
+    out = rec + rest
+    for i, o in enumerate(out, 1):
+        o['order'] = i
+    return out
+
+def _label(kind, tag, rec):
+    if kind == '2.6':
+        return '停在 2.6.x：%s%s' % (tag, '（推荐）' if rec else '')
+    return '升到 3.0.y：%s%s' % (tag, '（推荐）' if rec else '')
+
 def list_options(source_v, repo='milvusdb/milvus', mode='standalone', policy=None):
-    """Legal final targets given source. Two end-state families: 2.6.y and 3.0.y."""
+    """Legal final targets given source. Two end-state families: 2.6.y and 3.0.y.
+
+    列出 ga_2_6 / ga_3_0 中【所有】严格高于源版本的 GA tag（不降级、不同版本、不含 rc/beta/alpha），
+    推荐项在前，其余从新到旧。镜像仓库可用性由 apply_availability() 另行过滤。"""
     policy = policy or load_policy()
     out = []
     block = is_blocked_source(source_v)
@@ -188,41 +213,76 @@ def list_options(source_v, repo='milvusdb/milvus', mode='standalone', policy=Non
         return out, block
     pins = policy['pins']
     st = source_v['tuple']
-    # End-state A: GA 2.6.y > source (or any 2.6 if source is 2.5.x)
-    for t in policy.get('offer_2_6', []):
-        tv = _as_ga(t)
-        if cmp_ga(tv, source_v) == 1:
-            rec = (t == pins['recommended_2_6'])
-            out.append({
-                'kind': '2.6', 'tag': tv['tag'], 'version': tv,
-                'image': '%s:%s' % (repo, tv['tag']),
-                'recommended': rec,
-                'label': '停在 2.6.x：%s%s' % (tv['tag'], '（推荐桥接/终点）' if rec else ''),
-            })
-    # End-state B: GA 3.0.y — allowed as final even from 2.5 (hops expand later);
-    # from 3.0.x only higher 3.0; from >3 not listed
+    seen = set()
+
+    def add(kind, t, rec_pin):
+        v = parse_version(t)
+        if not v or v['channel'] != 'ga' or is_blocked_target(v):
+            return
+        if cmp_ga(v, source_v) != 1 or v['tag'] in seen:
+            return
+        seen.add(v['tag'])
+        rp = parse_version(rec_pin) if rec_pin else None
+        rec = bool(rp) and rp['tuple'] == v['tuple']
+        out.append({'kind': kind, 'tag': v['tag'], 'version': v,
+                    'image': '%s:%s' % (repo, v['tag']), 'recommended': rec,
+                    'label': _label(kind, v['tag'], rec)})
+
+    # End-state A: GA 2.6.y > source
+    if st[0] < 3:
+        for t in ga_list(policy, '2_6'):
+            add('2.6', t, pins.get('recommended_2_6'))
+    # End-state B: GA 3.0.y — legal FINAL even from 2.5 (hops expand later); from 3.0.x only higher 3.0
     if st[0] < 3 or (st[0] == 3 and st[1] == 0):
-        for t in policy.get('offer_3_0', []):
-            tv = _as_ga(t)
-            if cmp_ga(tv, source_v) != 1:
-                continue
-            # 2.5 cannot go direct — still a legal FINAL (path will hop via 2.6)
-            rec = (t == pins['recommended_3_0'])
-            out.append({
-                'kind': '3.0', 'tag': tv['tag'], 'version': tv,
-                'image': '%s:%s' % (repo, tv['tag']),
-                'recommended': rec,
-                'label': '升到 3.0.y：%s%s' % (tv['tag'], '（推荐，文档验证路径终点）' if rec else ''),
-            })
-    # Deduplicate by tag, prefer recommended
-    seen = {}
-    for o in out:
-        prev = seen.get(o['tag'])
-        if prev is None or (o['recommended'] and not prev['recommended']):
-            seen[o['tag']] = o
-    ordered = sorted(seen.values(), key=lambda o: (0 if o['kind'] == '2.6' else 1, o['version']['tuple']))
-    # Ensure at least recommended pins appear when legal
-    return ordered, ''
+        for t in ga_list(policy, '3_0'):
+            add('3.0', t, pins.get('recommended_3_0'))
+    return order_options(out), ''
+
+def apply_availability(opts, status_by_tag):
+    """按镜像仓库检查结果过滤选项。
+
+    status_by_tag: {tag: 'present'|'absent'|'unverified'}（多跳时传该选项所有 hop 中最差的状态）。
+    返回 (available, unavailable)：
+      - absent 的选项移入 unavailable（不可选，reason=image_not_found）；
+      - 未出现在 status_by_tag 的视为 unverified；
+      - 若某个系列的推荐 tag 不可用，则把该系列中可用的最新 tag 标为推荐（label 也改写），并重新排序。"""
+    avail, unavail = [], []
+    for o in opts:
+        o = dict(o)
+        o['pull'] = status_by_tag.get(o['tag'], 'unverified')
+        (unavail if o['pull'] == 'absent' else avail).append(o)
+    for kind in ('2.6', '3.0'):
+        fam = [o for o in avail if o['kind'] == kind]
+        if not fam or any(o['recommended'] for o in fam):
+            continue
+        had_rec = any(o['recommended'] for o in unavail if o['kind'] == kind)
+        if not had_rec:
+            continue
+        # 优先已确认存在的最新版，其次 unverified 的最新版
+        best = sorted(fam, key=lambda o: (1 if o['pull'] == 'present' else 0, o['version']['tuple']), reverse=True)[0]
+        best['recommended'] = True
+        best['recommended_fallback'] = True
+        best['label'] = _label(kind, best['tag'], True)
+    for o in unavail:
+        o['recommended'] = False
+    return order_options(avail), sorted(unavail, key=lambda o: o['version']['tuple'], reverse=True)
+
+def group_summary(avail, unavail):
+    """每个系列一行摘要，供 C1（先选终态）使用。"""
+    res = []
+    for kind in ('2.6', '3.0'):
+        a = [o for o in avail if o['kind'] == kind]
+        u = [o for o in unavail if o['kind'] == kind]
+        if not a and not u:
+            continue
+        rec = [o['tag'] for o in a if o['recommended']]
+        tags = sorted(a, key=lambda o: o['version']['tuple'])
+        res.append({'kind': kind, 'available': len(a), 'unavailable': len(u),
+                    'recommended': rec[0] if rec else '-',
+                    'newest': tags[-1]['tag'] if tags else '-',
+                    'oldest': tags[0]['tag'] if tags else '-',
+                    'unavailable_tags': [o['tag'] for o in u]})
+    return res
 
 def plan_hops(source_v, target_v, mode='standalone', has_mixcoord=False, operator_ver='', policy=None):
     """Expand required hops. Returns dict with hops, warns, blocks, infos."""
@@ -403,6 +463,7 @@ def main(argv=None):
     o.add_argument('--source', required=True)
     o.add_argument('--repo', default='milvusdb/milvus')
     o.add_argument('--mode', default='standalone', choices=['standalone', 'cluster'])
+    o.add_argument('--unavailable', default='', help='逗号分隔：镜像仓库中不存在的 tag（离线测试用）')
     pl = sub.add_parser('plan')
     pl.add_argument('--source', required=True)
     pl.add_argument('--target', required=True)
@@ -438,10 +499,20 @@ def main(argv=None):
         opts, block = list_options(sv, repo=a.repo, mode=a.mode, policy=policy)
         if block:
             print('PATH_BLOCK %s' % block); return 5
+        unavail = []
+        if a.unavailable:
+            st_ = dict((t if t.startswith('v') else 'v' + t, 'absent') for t in a.unavailable.split(',') if t)
+            opts, unavail = apply_availability(opts, st_)
+        for g in group_summary(opts, unavail):
+            print('TARGET_GROUP kind=%s available=%d unavailable=%d recommended=%s newest=%s oldest=%s' % (
+                g['kind'], g['available'], g['unavailable'], g['recommended'], g['newest'], g['oldest']))
         for o_ in opts:
-            print('TARGET_OPTION kind=%s tag=%s image=%s recommended=%s label=%s' % (
-                o_['kind'], o_['tag'], o_['image'], 'yes' if o_['recommended'] else 'no', o_['label'].replace(' ', '_')))
-        print('TARGET_OPTIONS count=%d' % len(opts))
+            print('TARGET_OPTION kind=%s tag=%s image=%s recommended=%s pull=%s order=%d label=%s' % (
+                o_['kind'], o_['tag'], o_['image'], 'yes' if o_['recommended'] else 'no',
+                o_.get('pull', 'unchecked'), o_['order'], o_['label'].replace(' ', '_')))
+        for o_ in unavail:
+            print('TARGET_UNAVAILABLE kind=%s tag=%s image=%s reason=image_not_found' % (o_['kind'], o_['tag'], o_['image']))
+        print('TARGET_OPTIONS count=%d unavailable=%d' % (len(opts), len(unavail)))
         return 0
 
     if a.cmd == 'plan':
@@ -515,6 +586,56 @@ def selftest(policy=None):
     expect('v2.6.26' in tags, '2.6.25 can go to 2.6.26')
     expect(any(o['kind'] == '3.0' for o in opts2), '2.6.25 can go to 3.0')
     expect('v2.6.20' not in tags, '2.6.20 not offered from 2.6.25')
+
+    # ---- 全量 GA 选项 ----
+    ga26 = ['v' + t for t in ga_list(policy, '2_6')]
+    ga30 = ['v' + t for t in ga_list(policy, '3_0')]
+    expect(len(ga26) == 27 and ga26[0] == 'v2.6.0' and ga26[-1] == 'v2.6.26', 'policy lists all GA 2.6.0..2.6.26')
+    expect(ga30 == ['v3.0.0', 'v3.0.1', 'v3.0.2', 'v3.0.3', 'v3.0.4'], 'policy lists all GA 3.0.0..3.0.4')
+    t25 = [o['tag'] for o in opts]
+    expect('v2.6.0' in t25 and 'v2.6.10' in t25 and 'v2.6.21' in t25, '2.5.10 offers v2.6.0 / v2.6.10 / v2.6.21')
+    expect(sum(1 for o in opts if o['kind'] == '2.6') == 27 and sum(1 for o in opts if o['kind'] == '3.0') == 5,
+           '2.5.10 offers all 27 GA 2.6 and all 5 GA 3.0')
+    expect(not any(parse_version(t)['channel'] != 'ga' for t in t25), 'no rc/beta/alpha in options')
+    expect(opts[0]['tag'] == 'v2.6.25' and opts[0]['recommended'] and opts[1]['tag'] == 'v3.0.3' and opts[1]['recommended'],
+           'recommended first (2.6 rec, then 3.0 rec)')
+    rest = [o['version']['tuple'] for o in opts[2:]]
+    expect(rest == sorted(rest, reverse=True) and opts[2]['tag'] == 'v3.0.4', 'rest newest-first')
+    expect([o['order'] for o in opts] == list(range(1, len(opts) + 1)), 'order field 1..N')
+    o10, _ = list_options(parse_version('v2.6.10'), policy=policy)
+    t10 = [o['tag'] for o in o10]
+    expect('v2.6.10' not in t10 and 'v2.6.9' not in t10 and 'v2.6.11' in t10, '2.6.10 excludes <=2.6.10, includes 2.6.11')
+    expect(len([t for t in t10 if t.startswith('v2.6.')]) == 16, '2.6.10 offers 16 higher 2.6 tags')
+    o26top, _ = list_options(parse_version('v2.6.26'), policy=policy)
+    expect([o['kind'] for o in o26top] == ['3.0'] * 5, 'latest 2.6 source → only 3.0 options')
+    o30, _ = list_options(parse_version('v3.0.1'), policy=policy)
+    expect([o['tag'] for o in o30] == ['v3.0.3', 'v3.0.4', 'v3.0.2'], '3.0.1 source: only higher 3.0 (rec first)')
+    o_rc, b_rc = list_options(parse_version('v2.6.0-rc1'), policy=policy)
+    expect(bool(b_rc) and not o_rc, '2.6.0-rc1 source still blocked')
+    # ---- 镜像可用性 ----
+    av, un = apply_availability(opts, {'v2.6.26': 'absent', 'v3.0.4': 'absent', 'v2.6.25': 'present', 'v3.0.3': 'present'})
+    tav = [o['tag'] for o in av]
+    expect('v2.6.26' not in tav and 'v3.0.4' not in tav, 'absent tags hidden from selectable options')
+    expect([o['tag'] for o in un] == ['v3.0.4', 'v2.6.26'], 'absent tags listed as unavailable')
+    expect(all(o['pull'] in ('present', 'unverified') for o in av), 'available options carry pull status')
+    av2, un2 = apply_availability(opts, {'v2.6.25': 'absent', 'v2.6.24': 'present', 'v3.0.3': 'absent', 'v3.0.2': 'present'})
+    r2 = [o['tag'] for o in av2 if o['recommended']]
+    expect(r2 == ['v2.6.24', 'v3.0.2'] and av2[0]['tag'] == 'v2.6.24', 'recommended falls back to newest present tag')
+    expect(not any(o['recommended'] for o in un2), 'unavailable never recommended')
+    gs = group_summary(av, un)
+    expect(gs[0]['kind'] == '2.6' and gs[0]['available'] == 26 and gs[0]['unavailable'] == 1 and gs[0]['newest'] == 'v2.6.25',
+           'group summary 2.6')
+    expect(gs[1]['kind'] == '3.0' and gs[1]['available'] == 4 and gs[1]['recommended'] == 'v3.0.3', 'group summary 3.0')
+    av3, _ = apply_availability(opts, {'v3.0.0': 'absent', 'v3.0.1': 'absent', 'v3.0.2': 'absent', 'v3.0.3': 'absent', 'v3.0.4': 'absent'})
+    expect(not any(o['kind'] == '3.0' for o in av3), 'family fully absent → no 3.0 options')
+
+    # plan: 2.5.10 → 2.6.10 (non-recommended old 2.6) via 2.5.16
+    p0 = plan_hops(parse_version('v2.5.10'), parse_version('v2.6.10'), mode='cluster',
+                   has_mixcoord=False, operator_ver='1.3.12', policy=policy)
+    expect([h['tag'] for h in p0['hops']] == ['v2.5.16', 'v2.6.10'] and not p0['blocks'], '2.5.10 cluster → 2.6.10 hops [2.5.16, 2.6.10]')
+    p0b = plan_hops(parse_version('v2.5.16'), parse_version('v2.6.0'), mode='standalone',
+                    has_mixcoord=False, operator_ver='1.3.12', policy=policy)
+    expect([h['tag'] for h in p0b['hops']][-1] == 'v2.6.0' and not p0b['blocks'], '2.5.16 → 2.6.0 allowed')
 
     # plan: 2.5.10 → 2.6.25 expands via 2.5.16
     p = plan_hops(parse_version('v2.5.10'), parse_version('v2.6.25'), mode='cluster',

@@ -13,6 +13,7 @@ import argparse, fcntl, glob, json, os, re, shutil, socket, stat, subprocess, sy
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 import upgrade_paths as upaths
+import registry_check as regchk
 
 ap = argparse.ArgumentParser()
 ap.add_argument('mode', choices=['upgrade', 'restore'])
@@ -411,11 +412,53 @@ if a.mode == 'upgrade':
     # 列出合法终点（两端对等：停在 2.6.x 或升到 GA 3.0.y）
     if src_ver and not upaths.is_blocked_source(src_ver):
         opts, _ob = upaths.list_options(src_ver, repo=repo or 'milvusdb/milvus', mode=mode, policy=policy)
+        # 每个候选终点按真实路径展开 hops，只读检查每一跳镜像在当前仓库/镜像源里是否存在
+        _opt_imgs = {}
         for o_ in opts:
-            print('TARGET_OPTION kind=%s tag=%s image=%s recommended=%s label=%s' % (
-                o_['kind'], o_['tag'], o_['image'], 'yes' if o_['recommended'] else 'no',
+            try:
+                _pl = upaths.plan_hops(src_ver, o_['version'], mode=mode, has_mixcoord=has_mixcoord,
+                                       operator_ver=opver or opimg, policy=policy)
+                _hops = [h['tag'] for h in _pl['hops']] or [o_['tag']]
+            except Exception:
+                _hops = [o_['tag']]
+            o_['hops'] = _hops
+            _opt_imgs[o_['tag']] = ['%s:%s' % (repo or 'milvusdb/milvus', t_) for t_ in _hops]
+        _all_imgs = []
+        for _l in _opt_imgs.values():
+            for _i in _l:
+                if _i not in _all_imgs:
+                    _all_imgs.append(_i)
+        _res = regchk.check_many(_all_imgs) if _all_imgs else {}
+        for _i in sorted(_all_imgs, key=lambda x: (upaths.parse_version(x) or {'tuple': (0, 0, 0)})['tuple']):
+            print(regchk.fmt_line(_i, _res[_i]))
+        _st = {}
+        _missing = {}
+        for t_, _l in _opt_imgs.items():
+            _st[t_] = regchk.worst(_res[_i][0] for _i in _l)
+            _missing[t_] = [_i for _i in _l if _res[_i][0] == 'absent']
+        _hops_by_tag = dict((o_['tag'], o_['hops']) for o_ in opts)
+        opts, _unavail = upaths.apply_availability(opts, _st)
+        for g in upaths.group_summary(opts, _unavail):
+            print('TARGET_GROUP kind=%s available=%d unavailable=%d recommended=%s newest=%s oldest=%s' % (
+                g['kind'], g['available'], g['unavailable'], g['recommended'], g['newest'], g['oldest']))
+        for o_ in opts:
+            print('TARGET_OPTION kind=%s tag=%s image=%s recommended=%s pull=%s hops=%s order=%d label=%s' % (
+                o_['kind'], o_['tag'], o_['image'], 'yes' if o_['recommended'] else 'no', o_['pull'],
+                ','.join(_hops_by_tag.get(o_['tag']) or [o_['tag']]), o_['order'],
                 o_['label'].replace(' ', '_')))
+        for o_ in _unavail:
+            print('TARGET_UNAVAILABLE kind=%s tag=%s image=%s reason=image_not_found missing=%s' % (
+                o_['kind'], o_['tag'], o_['image'], ','.join(_missing.get(o_['tag']) or [o_['image']])))
         fact('target_options', len(opts))
+        fact('target_unavailable', ','.join(o_['tag'] for o_ in _unavail) or '-')
+        _n_un = sum(1 for v_ in _res.values() if v_[0] == 'unverified')
+        if _unavail:
+            item('image_registry', 'INFO', '仓库 %s 中不存在、已从选项中隐藏：%s' % (repo, ','.join(o_['tag'] for o_ in _unavail)))
+        if _n_un:
+            _why = sorted(set(v_[2].split(';')[0] for v_ in _res.values() if v_[0] == 'unverified'))
+            item('image_registry', 'WARN', '%d 个镜像无法确认是否存在（%s）；标记 pull=unverified，正式运行的节点拉取检查会再验证' % (_n_un, ','.join(_why)[:200]))
+        elif _all_imgs and not _unavail:
+            item('image_registry', 'PASS', '仓库 %s 中全部 %d 个候选镜像均存在' % (repo, len(_all_imgs)))
         # 默认推荐建议（供兼容旧 SUGGEST 行）：优先推荐 3.0，否则推荐 2.6
         rec = next((o_ for o_ in opts if o_['recommended'] and o_['kind'] == '3.0'), None) \
             or next((o_ for o_ in opts if o_['recommended']), None) \
@@ -435,6 +478,11 @@ if a.mode == 'upgrade':
         print('SUGGEST target_image=%s' % tgt)
         print('SUGGEST official_image=milvusdb/milvus:%s' % (tgt.rsplit(':', 1)[-1]))
         tb = upaths.is_blocked_target(tv_full) if tv_full else '无法解析目标版本: ' + tgt
+        if tv_full and not tb:
+            _known = ['v' + t_ for t_ in upaths.ga_list(policy, '2_6') + upaths.ga_list(policy, '3_0')]
+            if tv_full['tag'] not in _known:
+                print('PATH_WARN 目标 %s 不在 skill 已知的 GA 列表中（upgrade_paths.json ga_2_6/ga_3_0）；仅在镜像可拉取时允许继续' % tv_full['tag'])
+                item('version_target_known', 'WARN', '目标 %s 不在已知 GA 列表' % tv_full['tag'])
         already = (cur_img == tgt and status == 'Healthy')
         if tb:
             _dref = policy['docs'].get('cluster_2_6_to_3_0', '')
@@ -469,6 +517,21 @@ if a.mode == 'upgrade':
                         (h.get('note') or '').replace('\n', ' ')[:200]))
                 print('PATH_PLAN final=%s hops=%s' % (plan['final'], ','.join(tags)))
                 fact('path_hops', ','.join(tags))
+                # 每一跳镜像都必须能从用户配置的仓库/镜像源拉到（只读 manifest HEAD，不拉镜像）
+                _trepo = upaths.repo_of(tgt)
+                _himgs = ['%s:%s' % (_trepo, t_) for t_ in tags] or [tgt]
+                _hres = regchk.check_many(_himgs)
+                for _i in _himgs:
+                    print(regchk.fmt_line(_i, _hres[_i]))
+                _abs = [_i for _i in _himgs if _hres[_i][0] == 'absent']
+                _unv = [_i for _i in _himgs if _hres[_i][0] == 'unverified']
+                if _abs:
+                    item('target_image_pull', 'FAIL', '镜像仓库中不存在：%s（换一个仓库里存在的 tag，或先把镜像同步到该仓库）' % ','.join(_abs))
+                elif _unv:
+                    item('target_image_pull', 'WARN', '无法确认镜像是否存在（%s）：%s；正式运行会在节点上做拉取检查，拉不到即中止' % (
+                        _hres[_unv[0]][2][:120], ','.join(_unv)))
+                else:
+                    item('target_image_pull', 'PASS', '全部 %d 跳镜像在仓库中存在：%s' % (len(_himgs), ','.join(_himgs)))
                 item('version_path', 'PASS', '%s → %s via %s' % (src_ver['tag'], plan['final'], ','.join(tags) or '(none)'))
                 # 软提示：2.6.x < verified 已在 WARN；cluster→3.0 完整 CR
                 if any(h['apply_mode'] == 'cluster_full_cr' for h in plan['hops']):
@@ -489,7 +552,7 @@ if a.mode == 'upgrade':
     if src_ver and src_ver['channel'] == 'ga' and src_ver['tuple'] < (2, 5, 16):
         item('version_bridge', 'INFO', '源 <2.5.16：正式路径会先跳到 %s（+Cluster mixCoord），见官方 2.5→2.6 文档' % pins['bridge_2_5_with_mixcoord'])
 
-    item('image_pull', 'INFO', '只读模式不建 Pod；正式运行会在 Milvus 所在节点（%s）做拉取检查' % (','.join(nodes) or '?'))
+    item('image_pull', 'INFO', '只读模式不建 Pod（仓库存在性见 IMAGE_CHECK / target_image_pull）；正式运行会在 Milvus 所在节点（%s）做拉取检查' % (','.join(nodes) or '?'))
 else:
     metas = []
     for f in sorted(glob.glob(os.path.join(runs, a.ns + '-[0-9]*', 'backup.meta')), reverse=True):

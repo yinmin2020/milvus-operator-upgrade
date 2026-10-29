@@ -287,6 +287,18 @@ if [ ${#HOP_IMAGES[@]} -eq 0 ]; then
   HOP_META=("${_htag:-vunknown}|0|-|merge")
 fi
 log "待执行 hops (${#HOP_IMAGES[@]}): ${HOP_IMAGES[*]}"
+# 只读确认每一跳镜像在用户配置的仓库/镜像源里存在（registry v2 manifest HEAD；不拉镜像）。
+# absent → 在改动 Milvus 之前中止；unverified（网络/私有仓库）→ WARN，第 4 步节点拉取检查兜底。
+if [ $ALREADY = 0 ]; then
+  REG_OUT=$(python3 "$SCRIPT_DIR/registry_check.py" check "${HOP_IMAGES[@]}" 2>&1 || true)
+  echo "$REG_OUT" | sed 's/^/  registry: /'
+  echo "$REG_OUT" > "$RUN_DIR/registry_check.txt"
+  REG_ABSENT=$(echo "$REG_OUT" | awk '/^IMAGE_CHECK / && / status=absent /{for(i=1;i<=NF;i++) if($i~/^image=/){sub(/^image=/,"",$i); printf "%s ", $i}}')
+  [ -z "$REG_ABSENT" ] || die 5 "镜像仓库中不存在: ${REG_ABSENT}（未做任何 Milvus 改动；换一个仓库里存在的 tag，或先把镜像同步到该仓库）"
+  if echo "$REG_OUT" | grep -q ' status=unverified '; then
+    log "WARN: 部分 hop 镜像无法通过仓库 API 确认是否存在（见上方 registry: 行），继续由第 4 步节点拉取检查确认"
+  fi
+fi
 bash "$SCRIPT_DIR/snapshot_svc.sh" "$NS" "$NAME" | tee "$RUN_DIR/svc_snapshot.txt"
 [ -s "$RUN_DIR/svc_snapshot.txt" ] || die 5 "找不到 $NAME 的 Service"
 SVC="$NAME-milvus"

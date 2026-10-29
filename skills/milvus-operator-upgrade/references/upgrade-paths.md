@@ -21,6 +21,37 @@
 
 不是每个用户都必须去 3.0。
 
+## 可选版本清单（全部 GA）
+
+`upgrade_paths.json` 的 `ga_2_6` / `ga_3_0` 列出**全部** GA 版本，选项 = 其中严格高于源版本的所有 tag：
+
+| 系列 | GA 版本 | 来源 |
+|------|---------|------|
+| 2.6 | v2.6.0 … v2.6.26（27 个） | milvus-docs `v2.6.x` release_notes.md 列到 v2.6.25；GitHub Releases（prerelease=false）另有 v2.6.26（2026-10-26 发布） |
+| 3.0 | v3.0.0 … v3.0.4（5 个） | milvus-docs `v3.0.x` release_notes.md 列到 v3.0.3；GitHub Releases 另有 v3.0.4（2026-10-26 发布） |
+| 排除 | v2.6.0-rc1、v3.0-beta | 预发布，不作为目标 |
+
+核对日期 2026-10-29（milvus.io 对抓取返回 403，故以 milvus-io/milvus-docs 源文件和 GitHub Releases 为准）。新补丁发布后：追加到 `ga_*`、更新 `latest_known_*`；`recommended_*` 只在文档验证后再改。
+
+- 排序：推荐项在前（2.6 推荐、3.0 推荐），其余从新到旧。
+- 展示：先选终态（2.6 / 3.0），再在该系列里分页选具体版本，允许直接输入 tag（见 SKILL.md 第 C 节）。
+
+## 镜像仓库可用性（`scripts/registry_check.py`）
+
+候选终点和选定目标的**每一跳**镜像都按用户当前镜像的仓库（如 `registry.cn-hangzhou.aliyuncs.com/xy-zy/milvus`，默认 `milvusdb/milvus`）做只读检查：
+
+1. registry v2 `HEAD /v2/<repo>/manifests/<tag>`（401 Bearer → 匿名 token → 重试）：200 = present，404 = absent。
+2. API 无法确定时兜底：`docker manifest inspect` / `skopeo inspect --raw`（远端 manifest），`crictl inspecti` / `ctr images ls`（本地缓存，只能证明存在）。
+3. 仍无法确定（网络不通、私有仓库 401/403、429/5xx）= unverified：预检 WARN，不 FAIL。
+
+| 结果 | 选项 | 选定目标 |
+|------|------|----------|
+| present | `TARGET_OPTION pull=present` | `target_image_pull PASS` |
+| unverified | `TARGET_OPTION pull=unverified`（可选，需提示） | `target_image_pull WARN` |
+| absent（任一跳） | `TARGET_UNAVAILABLE`（不可选） | `target_image_pull FAIL`（rc=5，未做改动） |
+
+钉选的推荐 tag 在仓库中不存在时，推荐改为该系列仓库里存在的最新版。不拉镜像、不读凭据；`MILVUS_REGISTRY_CHECK=0` 关闭检查。
+
 ## 硬规则
 
 | 规则 | 行为 |
@@ -44,11 +75,11 @@
 
 ## 执行约定
 
-- 选项框只列**合法终点**；选定后 `plan` 展开所需 hops。
+- 选项框只列**合法终点**（且镜像在仓库里存在或无法确认）；选定后 `plan` 展开所需 hops，并检查每一跳镜像。
 - 每 hop 之间等待 **Healthy + MilvusUpdated + 镜像一致**。
 - 升级仍主要只改 Milvus 镜像（+ root `securityContext`）；例外仅文档要求的 operator 门槛提示与 Cluster `mixCoord` / 3.0 Cluster 完整 CR。
 - 密钥只来自环境变量；决策走选项框；不捆绑二进制；NS 作用域。
 
 ## 钉选版本（`upgrade_paths.json` pins）
 
-见 JSON：`bridge_2_5_with_mixcoord`、`recommended_2_6`、`recommended_3_0`、`verified_2_6_to_3_0_source/target`、`min_operator_for_2_5_to_2_6` 等。更新产品钉选时改 JSON 并跑 `python3 scripts/upgrade_paths.py selftest`。
+见 JSON：`ga_2_6`、`ga_3_0`（全部 GA 清单）、`bridge_2_5_with_mixcoord`、`recommended_2_6`、`recommended_3_0`、`verified_2_6_to_3_0_source/target`、`min_operator_for_2_5_to_2_6` 等。更新产品钉选时改 JSON 并跑 `python3 scripts/upgrade_paths.py selftest` 与 `python3 scripts/registry_check.py selftest`。
