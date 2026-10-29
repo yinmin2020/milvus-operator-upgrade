@@ -245,19 +245,23 @@ SOURCE_TAG=$(echo "$SRC_LINE" | sed -n 's/.* version=\([^ ]*\).*/\1/p')
 [ -n "$SOURCE_TAG" ] || SOURCE_TAG=$(python3 "$SCRIPT_DIR/upgrade_paths.py" parse "$CUR_IMAGE" | awk '/^PARSE ok=1/{print $0}' | sed -n 's/.* tag=\([^ ]*\).*/\1/p')
 TARGET_TAG_RESOLVED=$(python3 "$SCRIPT_DIR/upgrade_paths.py" parse "$TARGET_IMAGE" | awk '/^PARSE ok=1/{for(i=1;i<=NF;i++) if($i~/^tag=/){sub(/^tag=/,"",$i); print $i}}')
 PATH_OUT=$(mktemp)
-set +e
-python3 "$SCRIPT_DIR/upgrade_paths.py" plan --source "${SOURCE_TAG:-$CUR_IMAGE}" --target "${TARGET_TAG_RESOLVED:-$TARGET_IMAGE}" \
-  --mode "$MODE" --has-mixcoord "$HAS_MIX" --operator "${OPVER:-$OP_IMAGE}" >"$PATH_OUT" 2>&1
-prc=$?
-set -e
+prc=0
+if [ $ALREADY = 1 ]; then
+  # 已是目标镜像且 Healthy：不做路径规划（否则 plan 会按“同版本”报 PATH_BLOCK），只做校验
+  echo "PATH_INFO ALREADY：已是目标 ${TARGET_TAG_RESOLVED:-$TARGET_IMAGE}，跳过路径规划与 hops" >"$PATH_OUT"
+else
+  # 用 `|| prc=$?` 而非 set +e：ERR trap 不受 set +e 影响，否则 PATH_BLOCK 前会多打一条误导性的 ERROR
+  python3 "$SCRIPT_DIR/upgrade_paths.py" plan --source "${SOURCE_TAG:-$CUR_IMAGE}" --target "${TARGET_TAG_RESOLVED:-$TARGET_IMAGE}" \
+    --mode "$MODE" --has-mixcoord "$HAS_MIX" --operator "${OPVER:-$OP_IMAGE}" >"$PATH_OUT" 2>&1 || prc=$?
+fi
 cat "$PATH_OUT" | while IFS= read -r ln; do log "path: $ln"; done
-if grep -q '^PATH_BLOCK ' "$PATH_OUT"; then
+if [ $ALREADY = 0 ] && grep -q '^PATH_BLOCK ' "$PATH_OUT"; then
   die 5 "$(grep '^PATH_BLOCK ' "$PATH_OUT" | head -1 | sed 's/^PATH_BLOCK //')"
 fi
 [ $prc = 0 ] || [ $ALREADY = 1 ] || die 5 "版本路径规划失败（rc=$prc），见上方 path: 日志"
 PATH_PLAN_LINE=$(grep '^PATH_PLAN ' "$PATH_OUT" | tail -1 || true)
 HOP_TAGS=$(echo "$PATH_PLAN_LINE" | sed -n 's/.* hops=\([^ ]*\).*/\1/p')
-[ "$HOP_TAGS" = "BLOCKED" ] && die 5 "版本路径被阻止"
+[ "$HOP_TAGS" = "BLOCKED" ] && [ $ALREADY = 0 ] && die 5 "版本路径被阻止"
 # 软警告（如 2.6.x < 2.6.20）不阻断
 grep '^PATH_WARN ' "$PATH_OUT" >/dev/null && log "注意: 存在 PATH_WARN（不阻断，见 references/upgrade-paths.md）"
 log "版本路径计划: ${PATH_PLAN_LINE:-?}（官方文档；已验证参考 2.6.20→3.0.3；不强制 2.6.24）"
@@ -414,6 +418,8 @@ start_pf_all(){
 
 # ---------- 6. 探针(前) ----------
 PROBE_RES="跳过（未提供 --probe-collection）"
+# ALREADY 模式不进入下面的分支，报告仍会引用这些变量（set -u）：先给默认值
+RBAC_RES="已是目标版本，本次未做 RBAC 快照/比较"; RBAC_TEST_RES="未执行（已是目标版本）"; RBAC_RC=0
 if [ $ALREADY = 0 ]; then
 step "5. 端口转发 + 探针(升级前)"
 start_pf_all

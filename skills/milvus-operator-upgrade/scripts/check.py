@@ -435,8 +435,15 @@ if a.mode == 'upgrade':
         print('SUGGEST target_image=%s' % tgt)
         print('SUGGEST official_image=milvusdb/milvus:%s' % (tgt.rsplit(':', 1)[-1]))
         tb = upaths.is_blocked_target(tv_full) if tv_full else '无法解析目标版本: ' + tgt
+        already = (cur_img == tgt and status == 'Healthy')
         if tb:
-            item('version_target', 'FAIL', tb)
+            _dref = policy['docs'].get('cluster_2_6_to_3_0', '')
+            print('PATH_BLOCK %s 参见 %s' % (tb, _dref))
+            print('PATH_PLAN final=%s hops= BLOCKED' % (tv_full['tag'] if tv_full else tgt))
+            item('version_target', 'FAIL', '%s 参见 %s' % (tb, _dref))
+        elif already:
+            # 已是目标镜像且 Healthy：正式运行进入 ALREADY 模式只做校验，不展开 hops，也不按“同版本”阻断
+            item('version_path', 'INFO', '已是目标 %s：不展开 hops（ALREADY，只做校验）' % tgt.rsplit(':', 1)[-1])
         elif not src_ver:
             item('version_path', 'WARN', '有目标但源版本未解析，跳过路径展开')
         else:

@@ -136,7 +136,7 @@ def is_blocked_source(v):
         return '无法解析源版本'
     # 2.6.0-rc* specifically blocked by docs
     if v['major'] == 2 and v['minor'] == 6 and v['patch'] == 0 and v['channel'] == 'rc':
-        return '源版本为 2.6.0-rc*：官方文档声明与正式 2.6/3.0 不兼容，不支持直接升级（见 docs）'
+        return '源版本为 2.6.0-rc*：官方文档声明与正式 2.6/3.0 不兼容，不支持直接升级'
     if v['channel'] in ('rc', 'beta', 'alpha') and not (v['major'] == 2 and v['minor'] == 5):
         # other pre-releases as source: block conservatively
         return '源版本为预发布通道 %s（%s），本 skill 不支持以其为源升级' % (v['channel'], v['tag'])
@@ -231,13 +231,14 @@ def plan_hops(source_v, target_v, mode='standalone', has_mixcoord=False, operato
     docs = policy['docs']
     warns, blocks, infos, hops = [], [], [], []
 
+    doc_ref = docs.get('cluster_2_6_to_3_0', '')  # 版本路径声明（rc 不兼容 / 不用 beta）出自该页
     sb = is_blocked_source(source_v)
     if sb:
-        blocks.append(sb)
+        blocks.append(sb + (' 参见 ' + doc_ref if doc_ref else ''))
         return {'hops': [], 'warns': warns, 'blocks': blocks, 'infos': infos, 'final': None}
     tb = is_blocked_target(target_v)
     if tb:
-        blocks.append(tb + ' 参见 ' + docs.get('cluster_2_6_to_3_0', ''))
+        blocks.append(tb + (' 参见 ' + doc_ref if doc_ref else ''))
         return {'hops': [], 'warns': warns, 'blocks': blocks, 'infos': infos, 'final': None}
 
     if cmp_ga(target_v, source_v) is not None and cmp_ga(target_v, source_v) <= 0:
@@ -389,7 +390,9 @@ def _print_parse(v):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    sub = ap.add_subparsers(dest='cmd', required=True)
+    # 兼容 python3.6（CentOS/RHEL 7/8 系统自带）：add_subparsers 不支持 required= 关键字
+    sub = ap.add_subparsers(dest='cmd')
+    sub.required = True
 
     p = sub.add_parser('parse'); p.add_argument('value')
     d = sub.add_parser('discover')
@@ -559,9 +562,4 @@ def selftest(policy=None):
     print('SELFTEST ok'); return 0
 
 if __name__ == '__main__':
-    # argparse required=True on subparsers needs py3; provide fallback
-    try:
-        sys.exit(main() or 0)
-    except TypeError:
-        # py3.6 may not support required= on subparsers the same way — still fine on 3.6+ with required=
-        raise
+    sys.exit(main() or 0)

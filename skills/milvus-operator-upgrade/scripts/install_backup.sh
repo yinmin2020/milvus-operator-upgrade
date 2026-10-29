@@ -143,6 +143,7 @@ if ! scp -q "${OPTS[@]}" "$FROM" "$TARGET:$UP" </dev/null 2>/dev/null; then
 fi
 
 # 5. master 端：传输校验 → 解压/放置 → 架构、二进制 sha256、--help 自检 → 替换
+# 注：本 heredoc 位于 $( ) 内，case 分支一律写成 (pattern)，否则 macOS 自带 bash 3.2 解析报 syntax error near `;;`
 OUT=$(rssh "bash -s" <<REMOTE 2>&1
 set -u
 UP='$UP'; DEST='$DEST'; WB='$WB'; TMPD="\$WB/.mb-install-$$.d"; ALLOW='$ALLOW'
@@ -157,7 +158,7 @@ else
   cp "\$UP" "\$TMPD/milvus-backup" || { echo "REMOTE_ERR 5 复制失败"; exit 5; }
 fi
 em=\$(od -An -tu2 -j18 -N2 "\$TMPD/milvus-backup" 2>/dev/null | tr -d ' \n')
-case "\$em:$ARCH" in 62:x86_64|183:arm64) ;; *) echo "REMOTE_ERR 3 二进制架构（e_machine=\$em）与 master $ARCH 不符或不是 ELF"; exit 3 ;; esac
+case "\$em:$ARCH" in (62:x86_64|183:arm64) ;; (*) echo "REMOTE_ERR 3 二进制架构（e_machine=\$em）与 master $ARCH 不符或不是 ELF"; exit 3 ;; esac
 b=\$(sha256sum "\$TMPD/milvus-backup" | awk '{print \$1}')
 if [ "\$b" != '$SHA_BIN' ]; then
   [ "\$ALLOW" = 1 ] || { echo "REMOTE_ERR 4 二进制 sha256 不符: \$b（期望 $SHA_BIN）"; exit 4; }
@@ -165,9 +166,9 @@ if [ "\$b" != '$SHA_BIN' ]; then
 fi
 chmod 755 "\$TMPD/milvus-backup"
 h=\$(cd "\$TMPD" && ./milvus-backup --help 2>&1 | head -1)
-case "\$h" in '$MB_VER '*) ;;
-  [0-9]*' '*) [ "\$ALLOW" = 1 ] || { echo "REMOTE_ERR 7 版本不是 $MB_VER: \$h"; exit 7; }; echo "WARN: 版本 \$h 未经验证" ;;
-  *) echo "REMOTE_ERR 6 --help 自检失败: \$h"; exit 6 ;;
+case "\$h" in ('$MB_VER '*) ;;
+  ([0-9]*' '*) [ "\$ALLOW" = 1 ] || { echo "REMOTE_ERR 7 版本不是 $MB_VER: \$h"; exit 7; }; echo "WARN: 版本 \$h 未经验证" ;;
+  (*) echo "REMOTE_ERR 6 --help 自检失败: \$h"; exit 6 ;;
 esac
 if [ -e "\$DEST" ]; then mv -f "\$DEST" "\$DEST.bak-\$(date +%Y%m%d%H%M%S)" && echo "已把原有 \$DEST 改名为 .bak-*"; fi
 mv -f "\$TMPD/milvus-backup" "\$DEST" || { echo "REMOTE_ERR 5 写入 \$DEST 失败"; exit 5; }
