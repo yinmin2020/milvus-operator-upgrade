@@ -139,7 +139,8 @@ def read_token(var, fvar):
         mode_ = stat.S_IMODE(os.stat(f).st_mode)
         if mode_ & 0o077:
             return '', '%s 权限为 %o：必须是 600 或 400（chmod 600）' % (f, mode_)
-        return open(f).readline().strip(), ''
+        with open(f) as _tf:
+            return _tf.readline().strip(), ''
     except OSError as e:
         return '', '%s 不可读: %s' % (f, e.strerror)
 
@@ -275,10 +276,11 @@ MB_REL = 'https://github.com/zilliztech/milvus-backup/releases/tag/v%s' % MB_VER
 MB_URL = 'https://github.com/zilliztech/milvus-backup/releases/download/v%s/milvus-backup_%s_Linux_%s.tar.gz' % (MB_VER, MB_VER, MARCH)
 KNOWN = {}  # sha256 -> 名称（scripts/milvus-backup-sha256.txt，随 scripts 一起传到 master）
 try:
-    for ln in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'milvus-backup-sha256.txt'), encoding='utf-8'):
-        f2 = ln.split()
-        if len(f2) == 2 and not ln.startswith('#') and re.match(r'^[0-9a-f]{64}$', f2[0]):
-            KNOWN[f2[0]] = f2[1]
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'milvus-backup-sha256.txt'), encoding='utf-8') as _shaf:
+        for ln in _shaf:
+            f2 = ln.split()
+            if len(f2) == 2 and not ln.startswith('#') and re.match(r'^[0-9a-f]{64}$', f2[0]):
+                KNOWN[f2[0]] = f2[1]
 except Exception:
     pass
 EXP_TGZ = next((h for h, n in KNOWN.items() if n == 'milvus-backup_%s_Linux_%s.tar.gz' % (MB_VER, MARCH)), '')
@@ -557,14 +559,18 @@ else:
     metas = []
     for f in sorted(glob.glob(os.path.join(runs, a.ns + '-[0-9]*', 'backup.meta')), reverse=True):
         m = {}
-        for ln in open(f):
-            if '=' in ln:
-                kk, vv = ln.rstrip('\n').split('=', 1); m[kk] = vv
+        with open(f) as _mf:
+            for ln in _mf:
+                if '=' in ln:
+                    kk, vv = ln.rstrip('\n').split('=', 1); m[kk] = vv
         if m.get('CR') != name:
             continue
         ed = m.get('EXPORT_DIR', '')
         man = os.path.join(ed, 'MANIFEST') if ed else ''
-        nobj = sum(1 for _ in open(man)) if man and os.path.isfile(man) else 0
+        nobj = 0
+        if man and os.path.isfile(man):
+            with open(man) as _manf:
+                nobj = sum(1 for _ in _manf)
         # 备份是否含 RBAC 元数据（读本地导出的 full_meta.json / backup_meta.json，只统计数量，不输出内容）
         rb = 'unknown'
         # milvus-backup 0.6.x 的 rbac_meta 只在 full_meta.json 里；旧版本在 backup_meta.json
@@ -575,7 +581,8 @@ else:
                 bm = p_; break
         if bm:
             try:
-                r_ = json.load(open(bm)).get('rbac_meta') or {}
+                with open(bm) as _bmf:
+                    r_ = json.load(_bmf).get('rbac_meta') or {}
                 rb = 'yes' if any(r_.get(x_) for x_ in ('users', 'roles', 'grants', 'privilege_groups')) else 'no'
             except Exception:
                 rb = 'unknown'
